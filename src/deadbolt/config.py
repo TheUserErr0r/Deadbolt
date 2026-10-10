@@ -81,15 +81,48 @@ class FirewallProfile:
 @dataclass(frozen=True)
 class Policy:
     firewall_profiles: dict[str, FirewallProfile]
+    proxy_body_capture_enabled: bool = False
+    body_exclusion_allowed_suffixes: tuple[str, ...] = ()
 
     @classmethod
     def load(cls, path: Path) -> Policy:
         with path.open("rb") as stream:
             raw = tomllib.load(stream)
-        if set(raw) != {"firewall_profiles"} or not isinstance(raw["firewall_profiles"], dict):
-            raise ConfigurationError("profiles.toml requires only [firewall_profiles]")
+        if not set(raw) <= {"firewall_profiles", "proxy_body_capture", "body_capture_exclusions"} or not isinstance(raw.get("firewall_profiles"), dict):
+            raise ConfigurationError("profiles.toml requires [firewall_profiles]")
+        capture = raw.get("proxy_body_capture", {"enabled": False})
+        if not isinstance(capture, dict) or set(capture) != {"enabled"} or type(capture["enabled"]) is not bool:
+            raise ConfigurationError("proxy_body_capture requires only a boolean enabled field")
+        exclusions = raw.get("body_capture_exclusions", {"allowed_suffixes": []})
+        if not isinstance(exclusions, dict) or set(exclusions) != {"allowed_suffixes"}:
+            raise ConfigurationError("body_capture_exclusions requires only allowed_suffixes")
+        allowed = normalize_suffixes(exclusions["allowed_suffixes"])
         return cls({name: FirewallProfile.from_mapping(name, value)
-                    for name, value in raw["firewall_profiles"].items()})
+                    for name, value in raw["firewall_profiles"].items()}, capture["enabled"], allowed)
+
+
+def normalize_suffixes(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > 64:
+        raise ConfigurationError("exclusions must be a list of at most 64 DNS suffixes")
+    suffixes: list[str] = []
+    for suffix in value:
+        if (not isinstance(suffix, str) or not 4 <= len(suffix) <= 253
+                or suffix.lower() != suffix or suffix.endswith(".") or "." not in suffix
+                or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", part)
+                       for part in suffix.split("."))):
+            raise ConfigurationError("exclusion must be a normalized DNS suffix")
+        try:
+            ipaddress.ip_address(suffix)
+        except ValueError:
+            pass
+        else:
+            raise ConfigurationError("IP addresses are not exclusion suffixes")
+        if suffix in suffixes:
+            raise ConfigurationError("duplicate exclusion suffix")
+        suffixes.append(suffix)
+    if sum(len(suffix) + 1 for suffix in suffixes) > 8000:
+        raise ConfigurationError("exclusion suffix list is too large")
+    return tuple(sorted(suffixes))
 
 
 @dataclass(frozen=True)
@@ -132,15 +165,35 @@ class ExecutorConfig:
 
 
 def resolve_action(action: str, profile_name: str, reason: str, requested_ttl: int | None,
-                   policy: Policy, config: ExecutorConfig) -> dict[str, object]:
-    if action != "firewall_profile":
+                   policy: Policy, config: ExecutorConfig, requested_hours: int | None = None,
+                   requested_suffixes: list[str] | None = None) -> dict[str, object]:
+    if (not isinstance(reason, str) or not 1 <= len(reason) <= 500 or reason != reason.strip()
+            or any(not ch.isprintable() for ch in reason)):
+        raise ConfigurationError("reason must be 1-500 printable characters")
+    if action == "proxy_body_capture":
+        if (profile_name != "proxy_body_capture" or not policy.proxy_body_capture_enabled
+                or requested_ttl is not None or requested_suffixes is not None
+                or type(requested_hours) is not int
+                or not 1 <= requested_hours <= 24):
+            raise ConfigurationError("body capture profile or hours are not allowed")
+        return {"action": action, "profile": profile_name, "operation": "enable",
+                "hours": requested_hours, "ttl_seconds": requested_hours * 3600,
+                "reason": "body capture diagnostics"}
+    if action == "body_capture_exclusions":
+        if (profile_name != "body_capture_exclusions" or requested_ttl is not None
+                or requested_hours is not None or requested_suffixes is None):
+            raise ConfigurationError("invalid body capture exclusion request")
+        suffixes = normalize_suffixes(requested_suffixes)
+        if not policy.body_exclusion_allowed_suffixes or not set(suffixes).issubset(policy.body_exclusion_allowed_suffixes):
+            raise ConfigurationError("exclusion suffix is not root-allowed")
+        return {"action": action, "profile": profile_name, "operation": "replace",
+                "suffixes": list(suffixes), "ttl_seconds": 0,
+                "reason": "body capture exclusions update"}
+    if action != "firewall_profile" or requested_hours is not None or requested_suffixes is not None:
         raise ConfigurationError("action is disabled or unknown")
     profile = policy.firewall_profiles.get(profile_name)
     if profile is None:
         raise ConfigurationError("profile is not allowed")
-    if (not isinstance(reason, str) or not 1 <= len(reason) <= 500 or reason != reason.strip()
-            or any(not ch.isprintable() for ch in reason)):
-        raise ConfigurationError("reason must be 1-500 printable characters")
     if requested_ttl is not None and (type(requested_ttl) is not int or requested_ttl < 1):
         raise ConfigurationError("ttl_seconds must be a positive integer")
     ttl = min(requested_ttl or config.default_ttl_seconds, profile.max_ttl_seconds, config.max_ttl_seconds)
@@ -153,6 +206,16 @@ def resolve_action(action: str, profile_name: str, reason: str, requested_ttl: i
 
 
 def describe_action(action: dict[str, object]) -> str:
+    if action["action"] == "proxy_body_capture":
+        return (f"Enable decrypted HTTP request/response body capture for {action['hours']} hour(s).\n"
+                "Profile: proxy_body_capture\n"
+                "Decrypted HTTP request/response bodies will be retained on Argus for 24 hours.\n"
+                "The root-owned capture helper and its independent systemd timer enforce expiry.")
+    if action["action"] == "body_capture_exclusions":
+        return ("Replace body-capture exclusion suffixes with:\n"
+                + "\n".join(action["suffixes"]) + "\n"
+                "Only decrypted request/response bodies are suppressed for matching hosts. "
+                "Proxy routing, metadata, and firewall controls remain in force.")
     interface = f" on {action['interface']}" if action["interface"] else ""
     return (f"UFW allow {action['direction']}{interface}: {action['protocol']} "
             f"from {action['source']} to {action['destination']} port {action['port']}\n"

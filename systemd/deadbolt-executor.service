@@ -19,7 +19,7 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-ReadWritePaths=/run/deadbolt /run/ufw.lock /run/xtables.lock /var/lib/deadbolt /var/log/deadbolt /etc/ufw
+ReadWritePaths=/run/deadbolt /run/ufw.lock /run/xtables.lock /var/lib/deadbolt /var/log/deadbolt /etc/ufw -/etc/hermes-inspection-proxy
 
 [Install]
 WantedBy=multi-user.target

@@ -60,7 +60,7 @@ class Relay:
     async def submit(self, message: dict[str, Any], uid: int) -> dict[str, Any]:
         if uid != self.hermes_uid:
             raise ProtocolError("unauthorized Unix peer")
-        require_fields(message, {"op", "action", "profile", "reason"}, {"ttl_seconds"})
+        require_fields(message, {"op", "action", "profile", "reason"}, {"ttl_seconds", "hours", "suffixes"})
         if message["op"] != "submit":
             raise ProtocolError("Hermes may only submit requests")
         if any(not isinstance(message[key], str) for key in ("action", "profile", "reason")):
@@ -69,6 +69,10 @@ class Relay:
                    "reason": message["reason"], "requested_by_uid": uid}
         if "ttl_seconds" in message:
             payload["ttl_seconds"] = message["ttl_seconds"]
+        if "hours" in message:
+            payload["hours"] = message["hours"]
+        if "suffixes" in message:
+            payload["suffixes"] = message["suffixes"]
         return await self.root(payload)
 
     async def connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -105,6 +109,14 @@ class Relay:
 
     async def status(self, request_id: str) -> dict[str, Any]:
         return (await self.root({"op": "status", "request_id": request_id}))["request"]
+
+    async def capture_operator(self, operation: str, interaction_id: str, user_id: str,
+                               guild_id: str, channel_id: str) -> dict[str, Any]:
+        if operation not in ("capture_status", "capture_disable"):
+            raise ProtocolError("invalid capture operation")
+        return (await self.root({"op": operation, "interaction_id": interaction_id,
+                                 "user_id": user_id, "guild_id": guild_id,
+                                 "channel_id": channel_id}))["capture"]
 
     async def decide(self, row: dict[str, Any], decision: str, interaction_id: str,
                      user_id: str, guild_id: str, channel_id: str) -> dict[str, Any]:
@@ -287,6 +299,30 @@ async def run_discord(config: BotConfig) -> None:
                 f"Request {request_id}: denied. Card update failed; use /deadbolt status.", ephemeral=True)
             return
         await interaction.followup.send(f"Request {request_id}: denied", ephemeral=True)
+
+    async def capture_command(interaction: discord.Interaction, operation: str) -> None:
+        if not allowed(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await relay.capture_operator(operation, str(interaction.id),
+                str(interaction.user.id), str(interaction.guild_id), str(interaction.channel_id))
+            expiry = result["expires_at"] or "none"
+            await interaction.followup.send(
+                f"Body capture: {'enabled' if result['enabled'] else 'disabled'}; "
+                f"expiry: {expiry}; outcome: {result['outcome']}", ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            await interaction.followup.send(f"Capture command failed: {exc}", ephemeral=True)
+
+    @group.command(name="capture_status", description="Show authoritative body capture status")
+    async def capture_status_cmd(interaction: discord.Interaction) -> None:
+        await capture_command(interaction, "capture_status")
+
+    @group.command(name="capture_disable", description="Disable body capture now")
+    async def capture_disable_cmd(interaction: discord.Interaction) -> None:
+        await capture_command(interaction, "capture_disable")
 
     bot.tree.add_command(group, guild=guild)
 
