@@ -55,3 +55,4 @@ jobs:
           persist-credentials: false
       - run: docker build -f tests/ci/Dockerfile.ufw -t deadbolt-ufw-ci .
       - run: docker run --rm --network none --cap-add NET_ADMIN deadbolt-ufw-ci
+      - run: docker run --rm --network none --cap-add NET_ADMIN deadbolt-ufw-ci python3 /app/nft_live.py

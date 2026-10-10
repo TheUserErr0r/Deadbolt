@@ -12,7 +12,14 @@ config=/etc/hermes-inspection-proxy/evidence.env
 lock=/etc/hermes-inspection-proxy/.body-capture.lock
 umask 027
 exec 9>>"$lock"
-/usr/bin/flock -w 5 -x 9
+if ! /usr/bin/flock -w 5 -x 9 >/dev/null 2>&1; then
+  if $json; then
+    printf '{"enabled":false,"expires_at":null,"outcome":"internal_error"}\n'
+  else
+    printf 'internal_error\n' >&2
+  fi
+  exit 1
+fi
 
 read_value() {
   /usr/bin/sed -n "s/^$1=//p" "$config" | /usr/bin/tail -n 1

@@ -82,47 +82,65 @@ class FirewallProfile:
 class Policy:
     firewall_profiles: dict[str, FirewallProfile]
     proxy_body_capture_enabled: bool = False
-    body_exclusion_allowed_suffixes: tuple[str, ...] = ()
+    body_exclusion_allowed_hosts: tuple[str, ...] = ()
+    emergency_workload_units: tuple[str, ...] = ()
 
     @classmethod
     def load(cls, path: Path) -> Policy:
         with path.open("rb") as stream:
             raw = tomllib.load(stream)
-        if not set(raw) <= {"firewall_profiles", "proxy_body_capture", "body_capture_exclusions"} or not isinstance(raw.get("firewall_profiles"), dict):
+        if not set(raw) <= {"firewall_profiles", "proxy_body_capture", "body_capture_exclusions", "emergency_stop"} or not isinstance(raw.get("firewall_profiles"), dict):
             raise ConfigurationError("profiles.toml requires [firewall_profiles]")
         capture = raw.get("proxy_body_capture", {"enabled": False})
         if not isinstance(capture, dict) or set(capture) != {"enabled"} or type(capture["enabled"]) is not bool:
             raise ConfigurationError("proxy_body_capture requires only a boolean enabled field")
-        exclusions = raw.get("body_capture_exclusions", {"allowed_suffixes": []})
-        if not isinstance(exclusions, dict) or set(exclusions) != {"allowed_suffixes"}:
-            raise ConfigurationError("body_capture_exclusions requires only allowed_suffixes")
-        allowed = normalize_suffixes(exclusions["allowed_suffixes"])
+        exclusions = raw.get("body_capture_exclusions", {"allowed_hosts": []})
+        if not isinstance(exclusions, dict) or set(exclusions) != {"allowed_hosts"}:
+            raise ConfigurationError("body_capture_exclusions requires only allowed_hosts")
+        allowed = normalize_hosts(exclusions["allowed_hosts"])
+        emergency = raw.get("emergency_stop", {"workload_units": []})
+        if not isinstance(emergency, dict) or set(emergency) != {"workload_units"}:
+            raise ConfigurationError("emergency_stop requires only workload_units")
+        units = normalize_workload_units(emergency["workload_units"])
         return cls({name: FirewallProfile.from_mapping(name, value)
-                    for name, value in raw["firewall_profiles"].items()}, capture["enabled"], allowed)
+                    for name, value in raw["firewall_profiles"].items()}, capture["enabled"], allowed, units)
 
 
-def normalize_suffixes(value: object) -> tuple[str, ...]:
+def normalize_hosts(value: object) -> tuple[str, ...]:
     if not isinstance(value, list) or len(value) > 64:
-        raise ConfigurationError("exclusions must be a list of at most 64 DNS suffixes")
-    suffixes: list[str] = []
-    for suffix in value:
-        if (not isinstance(suffix, str) or not 4 <= len(suffix) <= 253
-                or suffix.lower() != suffix or suffix.endswith(".") or "." not in suffix
+        raise ConfigurationError("exclusions must be a list of at most 64 exact DNS hostnames")
+    hosts: list[str] = []
+    for host in value:
+        if (not isinstance(host, str) or not 4 <= len(host) <= 253
+                or host.lower() != host or host.endswith(".") or "." not in host
                 or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", part)
-                       for part in suffix.split("."))):
-            raise ConfigurationError("exclusion must be a normalized DNS suffix")
+                       for part in host.split("."))):
+            raise ConfigurationError("exclusion must be a normalized exact DNS hostname")
         try:
-            ipaddress.ip_address(suffix)
+            ipaddress.ip_address(host)
         except ValueError:
             pass
         else:
-            raise ConfigurationError("IP addresses are not exclusion suffixes")
-        if suffix in suffixes:
-            raise ConfigurationError("duplicate exclusion suffix")
-        suffixes.append(suffix)
-    if sum(len(suffix) + 1 for suffix in suffixes) > 8000:
-        raise ConfigurationError("exclusion suffix list is too large")
-    return tuple(sorted(suffixes))
+            raise ConfigurationError("IP addresses are not exclusion hostnames")
+        if host in hosts:
+            raise ConfigurationError("duplicate exclusion hostname")
+        hosts.append(host)
+    if sum(len(host) + 1 for host in hosts) > 8000:
+        raise ConfigurationError("exclusion hostname list is too large")
+    return tuple(sorted(hosts))
+
+
+def normalize_workload_units(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > 16:
+        raise ConfigurationError("workload_units must be a list of at most 16 services")
+    units: list[str] = []
+    for unit in value:
+        if (not isinstance(unit, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9@_.-]{0,100}\.service", unit)
+                or unit.startswith("deadbolt") or unit.startswith("alloy")
+                or unit == "hermes-tls-proxy.service" or unit in units):
+            raise ConfigurationError("invalid emergency workload unit")
+        units.append(unit)
+    return tuple(sorted(units))
 
 
 @dataclass(frozen=True)
@@ -179,16 +197,6 @@ def resolve_action(action: str, profile_name: str, reason: str, requested_ttl: i
         return {"action": action, "profile": profile_name, "operation": "enable",
                 "hours": requested_hours, "ttl_seconds": requested_hours * 3600,
                 "reason": "body capture diagnostics"}
-    if action == "body_capture_exclusions":
-        if (profile_name != "body_capture_exclusions" or requested_ttl is not None
-                or requested_hours is not None or requested_suffixes is None):
-            raise ConfigurationError("invalid body capture exclusion request")
-        suffixes = normalize_suffixes(requested_suffixes)
-        if not policy.body_exclusion_allowed_suffixes or not set(suffixes).issubset(policy.body_exclusion_allowed_suffixes):
-            raise ConfigurationError("exclusion suffix is not root-allowed")
-        return {"action": action, "profile": profile_name, "operation": "replace",
-                "suffixes": list(suffixes), "ttl_seconds": 0,
-                "reason": "body capture exclusions update"}
     if action != "firewall_profile" or requested_hours is not None or requested_suffixes is not None:
         raise ConfigurationError("action is disabled or unknown")
     profile = policy.firewall_profiles.get(profile_name)
@@ -206,16 +214,23 @@ def resolve_action(action: str, profile_name: str, reason: str, requested_ttl: i
 
 
 def describe_action(action: dict[str, object]) -> str:
+    if action["action"] == "emergency_recover":
+        units = action["previously_active"]
+        return ("RECOVERY: remove the Hermes direct-egress kill-switch block.\n"
+                "Start only services that were active before emergency stop: "
+                + (", ".join(units) if units else "none") + "\n"
+                "This restores Hermes network capability. Approval is separate from emergency stop.\n"
+                f"Kill-switch generation: {action['generation']}")
     if action["action"] == "proxy_body_capture":
         return (f"Enable decrypted HTTP request/response body capture for {action['hours']} hour(s).\n"
                 "Profile: proxy_body_capture\n"
                 "Decrypted HTTP request/response bodies will be retained on Argus for 24 hours.\n"
                 "The root-owned capture helper and its independent systemd timer enforce expiry.")
     if action["action"] == "body_capture_exclusions":
-        return ("Replace body-capture exclusion suffixes with:\n"
-                + "\n".join(action["suffixes"]) + "\n"
-                "Only decrypted request/response bodies are suppressed for matching hosts. "
-                "Proxy routing, metadata, and firewall controls remain in force.")
+        return (f"{action['operation'].capitalize()} exact body-capture exclusion: {action['hostname']}\n"
+                "Resulting exact hostnames:\n" + ("\n".join(action["hosts"]) or "(none)") + "\n"
+                "Only decrypted request/response bodies are suppressed for exact SNI, then Host matches. "
+                "Proxy routing, DNS and connection metadata, audit logs, and firewall controls remain in force.")
     interface = f" on {action['interface']}" if action["interface"] else ""
     return (f"UFW allow {action['direction']}{interface}: {action['protocol']} "
             f"from {action['source']} to {action['destination']} port {action['port']}\n"

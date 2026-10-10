@@ -6,10 +6,16 @@
 [proxy_body_capture]
 enabled = false
 
-# A later exclusion edit is a separate, Discord-approved Deadbolt request.
-# Only suffixes in this root-owned list may be selected by that action.
+# Only exact hostnames deliberately reviewed by the operator belong here.
+# The list starts empty. For a local LLM, establish a stable internal FQDN
+# (for example llm.home.arpa) before approving it in this root-owned policy.
 [body_capture_exclusions]
-allowed_suffixes = ["discord.com", "discordapp.com", "discordapp.net", "discordcdn.com"]
+allowed_hosts = []
+
+# Empty by default. The proxy is always stopped by emergency stop; only
+# explicitly configured additional workload services are stopped.
+[emergency_stop]
+workload_units = []
 
 # Replace the destination with an exact approved CIDR before enabling a profile.
 # [firewall_profiles.https-temporary]

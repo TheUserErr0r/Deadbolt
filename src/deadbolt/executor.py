@@ -16,8 +16,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from deadbolt.actions import ActionError, CaptureAction, CaptureError, ExclusionsAction, UfwAction
-from deadbolt.config import ConfigurationError, ExecutorConfig, Policy, resolve_action
+from deadbolt.actions import ActionError, CaptureAction, CaptureError, EmergencyAction, ExclusionsAction, UfwAction
+from deadbolt.config import ConfigurationError, ExecutorConfig, Policy, describe_action, normalize_workload_units, resolve_action
 from deadbolt.protocol import MAX_MESSAGE_BYTES, ProtocolError, peer_uid, read_message, require_fields, write_message
 from deadbolt.store import StateError, Store, canonical_json
 
@@ -29,7 +29,8 @@ class Executor:
                  action: UfwAction | None = None, clock: Callable[[], float] = time.time,
                  policy_loader: Callable[[], Policy] | None = None,
                  capture_action: CaptureAction | None = None,
-                 exclusions_action: ExclusionsAction | None = None):
+                 exclusions_action: ExclusionsAction | None = None,
+                 emergency_action: EmergencyAction | None = None):
         self.config = config
         self.policy = policy
         self.policy_loader = policy_loader or (lambda: Policy.load(config.profiles_path))
@@ -43,21 +44,47 @@ class Executor:
         self.bot_uid = bot_account.pw_uid
         self.bot_gid = bot_account.pw_gid
         self.hermes_uid = pwd.getpwnam(config.hermes_user).pw_uid
+        self.emergency_action = emergency_action or EmergencyAction(self.hermes_uid)
 
     def _revalidate(self, row: Any) -> dict[str, Any]:
         original = json.loads(row["canonical_json"])
         capture = original["action"] == "proxy_body_capture"
         exclusions = original["action"] == "body_capture_exclusions"
-        current = resolve_action(original["action"], original["profile"], original["reason"],
-                                 None if capture or exclusions else original["ttl_seconds"],
-                                 self.policy_loader(), self.config,
-                                 original.get("hours") if capture else None,
-                                 original.get("suffixes") if exclusions else None)
+        policy = self.policy_loader()
+        if original["action"] == "emergency_recover":
+            state = self.store.emergency_state()
+            current = self._recovery_canonical(state, policy)
+        elif exclusions:
+            self.exclusions_action.validate(original)
+            if (original["hostname"] not in policy.body_exclusion_allowed_hosts
+                    or not set(original["hosts"]).issubset(policy.body_exclusion_allowed_hosts)):
+                raise StateError("exclusions no longer match root policy")
+            current = original
+        else:
+            current = resolve_action(original["action"], original["profile"], original["reason"],
+                                     None if capture else original["ttl_seconds"],
+                                     policy, self.config,
+                                     original.get("hours") if capture else None)
         if (canonical_json(current) != row["canonical_json"] or
                 hashlib.sha256(row["canonical_json"].encode()).hexdigest() != row["canonical_hash"]):
             raise StateError("stored action no longer matches root policy")
-        (self.capture_action if capture else self.exclusions_action if exclusions else self.action).validate(current)
+        if original["action"] != "emergency_recover":
+            (self.capture_action if capture else self.exclusions_action if exclusions else self.action).validate(current)
         return current
+
+    @staticmethod
+    def _recovery_canonical(state: dict[str, Any], policy: Policy) -> dict[str, Any]:
+        if state["state"] != "active" or tuple(state["workload_units"]) != policy.emergency_workload_units:
+            raise StateError("emergency state or root policy changed before recovery")
+        normalize_workload_units(state["workload_units"])
+        if not set(state["previously_active"]).issubset(
+                {EmergencyAction.proxy_unit, *state["workload_units"]}):
+            raise StateError("invalid saved emergency service state")
+        return {"action": "emergency_recover", "profile": "emergency_recover",
+                "operation": "recover", "generation": state["generation"],
+                "workload_units": state["workload_units"],
+                "previously_active": state["previously_active"],
+                "ttl_seconds": 0, "reason": "operator emergency recovery"}
 
     async def dispatch(self, message: dict[str, Any], uid: int) -> dict[str, Any]:
         if uid != self.bot_uid:
@@ -77,18 +104,94 @@ class Executor:
         now = self.clock()
         if op == "create":
             require_fields(message, {"op", "action", "profile", "reason", "requested_by_uid"},
-                           {"ttl_seconds", "hours", "suffixes"})
+                           {"ttl_seconds", "hours"})
             if type(message["requested_by_uid"]) is not int or message["requested_by_uid"] != self.hermes_uid:
                 raise ProtocolError("invalid claimed request origin")
             if not all(isinstance(message[key], str) for key in ("action", "profile", "reason")):
                 raise ProtocolError("invalid request fields")
             canonical = resolve_action(message["action"], message["profile"], message["reason"],
                                        message.get("ttl_seconds"), self.policy_loader(), self.config,
-                                       message.get("hours"), message.get("suffixes"))
+                                       message.get("hours"))
             action = (self.capture_action if canonical["action"] == "proxy_body_capture" else
-                      self.exclusions_action if canonical["action"] == "body_capture_exclusions" else self.action)
+                      self.action)
             action.validate(canonical)
             row = self.store.create(canonical, action.describe(canonical), self.hermes_uid, now)
+            return {"ok": True, "request": self.store.public(row)}
+        if op == "exclusion_create":
+            require_fields(message, {"op", "operation", "hostname", "user_id", "guild_id",
+                                     "channel_id", "interaction_id"})
+            self._operator(message)
+            if not isinstance(message["operation"], str) or not isinstance(message["hostname"], str):
+                raise ProtocolError("invalid exclusion fields")
+            try:
+                canonical = self.exclusions_action.create_change(
+                    message["operation"], message["hostname"],
+                    self.policy_loader().body_exclusion_allowed_hosts)
+            except (ActionError, ConfigurationError) as exc:
+                self.store.operator_event("exclusion_request_failed", now, message["user_id"],
+                                          message["interaction_id"], error=str(exc))
+                raise
+            row = self.store.create(canonical, self.exclusions_action.describe(canonical),
+                                    self.bot_uid, now, requested_by_discord_id=message["user_id"])
+            return {"ok": True, "request": self.store.public(row)}
+        if op in ("emergency_status", "emergency_stop", "emergency_recover_create"):
+            require_fields(message, {"op", "user_id", "guild_id", "channel_id", "interaction_id"})
+            self._operator(message)
+            if op == "emergency_status":
+                try:
+                    enforced = self.emergency_action.enabled()
+                    state = self.store.emergency_state()
+                    running = self.emergency_action.active_units(tuple(state["workload_units"]))
+                except ActionError as exc:
+                    self.store.emergency_event("emergency_status_failed", now,
+                        operator_id=message["user_id"], interaction_id=message["interaction_id"],
+                        error=str(exc))
+                    raise
+                self.store.emergency_event("emergency_status", now,
+                    operator_id=message["user_id"], interaction_id=message["interaction_id"])
+                return {"ok": True, "emergency": {**state, "egress_block_enforced": enforced,
+                                                     "running_units": list(running)}}
+            if op == "emergency_stop":
+                state = self.store.emergency_state()
+                if state["state"] == "inactive":
+                    units = self.policy_loader().emergency_workload_units
+                    try:
+                        previous = self.emergency_action.active_units(units)
+                    except ActionError as exc:
+                        self.store.emergency_event("emergency_stop_failed", now,
+                            operator_id=message["user_id"], interaction_id=message["interaction_id"],
+                            error=str(exc))
+                        raise
+                    state = self.store.emergency_transition(("inactive",), "stopping",
+                        "emergency_stop_started", now, operator_id=message["user_id"],
+                        interaction_id=message["interaction_id"], workload_units=units,
+                        previously_active=previous, next_generation=True)
+                try:
+                    self.emergency_action.enforce(tuple(state["workload_units"]))
+                except ActionError as exc:
+                    self.store.emergency_event("emergency_stop_failed", self.clock(),
+                        operator_id=message["user_id"], interaction_id=message["interaction_id"],
+                        error=str(exc))
+                    raise
+                if state["state"] != "active":
+                    state = self.store.emergency_transition(("stopping", "recovering"), "active",
+                        "emergency_stop_active", self.clock(), operator_id=message["user_id"],
+                        interaction_id=message["interaction_id"])
+                else:
+                    self.store.emergency_event("emergency_stop_idempotent", self.clock(),
+                        operator_id=message["user_id"], interaction_id=message["interaction_id"])
+                return {"ok": True, "emergency": {**state, "egress_block_enforced": True,
+                                                     "running_units": []}}
+            state = self.store.emergency_state()
+            try:
+                canonical = self._recovery_canonical(state, self.policy_loader())
+            except (StateError, ConfigurationError) as exc:
+                self.store.emergency_event("emergency_recovery_request_failed", now,
+                    operator_id=message["user_id"], interaction_id=message["interaction_id"],
+                    error=str(exc))
+                raise
+            row = self.store.create(canonical, describe_action(canonical), self.bot_uid, now,
+                                    requested_by_discord_id=message["user_id"])
             return {"ok": True, "request": self.store.public(row)}
         if op == "list":
             require_fields(message, {"op", "state"}, {"offset"})
@@ -154,6 +257,48 @@ class Executor:
     async def _execute(self, row: Any) -> Any:
         request_id = row["id"]
         now = self.clock()
+        if row["action"] == "emergency_recover":
+            started = False
+            try:
+                canonical = self._revalidate(row)
+                self.store.mark_executing(request_id, {"generation": canonical["generation"]}, now)
+                started = True
+                self.store.emergency_transition(("active",), "recovering",
+                    "emergency_recovery_started", now,
+                    operator_id=row["approved_by_discord_id"], request_id=request_id)
+                self.emergency_action.recover(tuple(canonical["previously_active"]),
+                                              tuple(canonical["workload_units"]))
+                self.store.emergency_transition(("recovering",), "inactive",
+                    "emergency_recovered", self.clock(),
+                    operator_id=row["approved_by_discord_id"], request_id=request_id,
+                    workload_units=(), previously_active=())
+                return self.store.mark_completed(request_id, self.clock(), "recovered")
+            except Exception as exc:
+                if not isinstance(exc, (ActionError, ConfigurationError, StateError, OSError)):
+                    LOG.exception("unexpected emergency recovery failure")
+                failure = (str(exc) if isinstance(exc, (ActionError, ConfigurationError, StateError, OSError))
+                           else "internal emergency recovery error")
+                rollback_error = None
+                if started:
+                    try:
+                        self.emergency_action.enforce(tuple(json.loads(row["canonical_json"])["workload_units"]))
+                    except Exception as rollback_exc:
+                        rollback_error = str(rollback_exc) if isinstance(rollback_exc, ActionError) else "internal emergency reblock error"
+                self.store.emergency_event("emergency_recovery_failed", self.clock(),
+                    operator_id=row["approved_by_discord_id"], request_id=request_id,
+                    error=failure)
+                if rollback_error is not None:
+                    self.store.rollback_error(request_id, rollback_error, self.clock())
+                    return self.store.get(request_id)
+                if started:
+                    state = self.store.emergency_state()
+                    if state["state"] in ("recovering", "inactive"):
+                        canonical = json.loads(row["canonical_json"])
+                        self.store.emergency_transition((state["state"],), "active",
+                            "emergency_recovery_rolled_back", self.clock(), request_id=request_id,
+                            workload_units=tuple(canonical["workload_units"]),
+                            previously_active=tuple(canonical["previously_active"]))
+                return self.store.mark_failed(request_id, failure, self.clock())
         if row["action"] == "proxy_body_capture":
             try:
                 canonical = self._revalidate(row)
@@ -180,10 +325,18 @@ class Executor:
                 self.exclusions_action.apply(canonical, intent)
                 return self.store.mark_completed(request_id, self.clock(), "replaced")
             except (ActionError, ConfigurationError, StateError, OSError) as exc:
-                # A failed atomic replacement may already have committed. On
-                # restart, reconciliation compares the persisted before/after.
                 if self.store.get(request_id)["status"] == "executing":
-                    return self.store.get(request_id)
+                    try:
+                        current = self.exclusions_action._read()
+                        intent = json.loads(self.store.get(request_id)["rollback_json"])
+                        if current == intent["after"]:
+                            return self.store.mark_completed(request_id, self.clock(), "recovered_applied")
+                        if hashlib.sha256(current.encode()).hexdigest() != intent["before_sha256"]:
+                            self.store.rollback_error(request_id, "exclusions changed externally", self.clock())
+                            return self.store.get(request_id)
+                    except (ActionError, OSError):
+                        self.store.rollback_error(request_id, "exclusions state needs inspection", self.clock())
+                        return self.store.get(request_id)
                 return self.store.mark_failed(request_id, str(exc), self.clock())
         try:
             canonical = self._revalidate(row)
@@ -208,6 +361,19 @@ class Executor:
         async with self.lock:
             now = self.clock()
             self.store.expire_pending(now)
+            emergency = self.store.emergency_state()
+            emergency_restored = emergency["state"] == "inactive"
+            if emergency["state"] != "inactive":
+                try:
+                    self.emergency_action.enforce(tuple(emergency["workload_units"]))
+                    emergency_restored = True
+                    if emergency["state"] != "active":
+                        self.store.emergency_transition((emergency["state"],), "active",
+                            "emergency_reconciled_to_stopped", self.clock())
+                except (ActionError, ConfigurationError, StateError) as exc:
+                    self.store.emergency_event("emergency_reconcile_failed", self.clock(),
+                        error=str(exc))
+                    LOG.exception("emergency switch reconciliation failed")
             for row in self.store.recovery_rows(now):
                 if row["status"] == "approved":
                     self.store.mark_failed(row["id"], "executor stopped before apply", self.clock())
@@ -215,6 +381,14 @@ class Executor:
                 if row["action"] == "proxy_body_capture":
                     self.store.mark_failed(row["id"], "capture execution interrupted; inspect helper status",
                                            self.clock())
+                    continue
+                if row["action"] == "emergency_recover":
+                    if emergency_restored and self.store.emergency_state()["state"] == "active":
+                        self.store.mark_failed(row["id"],
+                            "recovery interrupted; emergency stop remains active", self.clock())
+                    else:
+                        self.store.rollback_error(row["id"],
+                            "recovery interrupted; emergency state needs inspection", self.clock())
                     continue
                 if row["action"] == "body_capture_exclusions":
                     try:
@@ -224,7 +398,7 @@ class Executor:
                         self.exclusions_action.validate(canonical)
                         intent = json.loads(row["rollback_json"])
                         expected = (self.exclusions_action.header +
-                                    "".join(f"{suffix}\n" for suffix in canonical["suffixes"]))
+                                    "".join(f"{host}\n" for host in canonical["hosts"]))
                         if intent["after"] != expected:
                             raise StateError("stored exclusions intent changed")
                         current = self.exclusions_action._read()

@@ -4,7 +4,9 @@
 
 Human-approved, time-limited privileged actions for AI agents.
 
-Deadbolt v0.5 accepts a small structured request from an unprivileged `hermes` user, relays it through a dedicated `deadbolt` Discord bot account, and lets a root executor apply only root-owned profiles after a configured human approves. UFW profiles are supported; body capture remains disabled in the example policy until its helper and independent expiry timer are installed and tested. No generic command, destination, port, service name, or systemd unit can be supplied by Hermes. The repository deliberately contains no deployment credentials or real firewall profiles.
+Deadbolt is an experimental VM control plane for the Hermes agent system. Hermes sends structured requests over local Unix sockets; an unprivileged Discord bot presents them to a human operator; a root executor applies only predefined, root-owned actions. Deadbolt v0.6 supports UFW profiles, an operator-controlled emergency stop and recovery, and approved exact-host body-capture exclusions. Body capture remains disabled in the example policy until its helper and independent expiry timer are tested. Hermes cannot supply a command, arbitrary firewall rule, service name, or systemd unit. The repository contains no deployment credentials or real firewall profiles.
+
+> **Project provenance and caution:** The design was developed by a human for an agentic use case. This entire README was AI-generated from that design and reviewed by a human. That review does not guarantee clear writing, faithful implementation of the design, or suitability for a particular VM. Treat the documentation as a guide to verify against the code and your own test environment before relying on Deadbolt for access control.
 
 ## Architecture
 
@@ -16,6 +18,7 @@ hermes -- /run/deadbolt/ingress/hermes.sock --> deadbolt bot (no sudo)
                                          root executor --> UFW
                                                        --> fixed body-capture helper
                                                        --> approved exclusion file
+                                                       --> dedicated nftables emergency block
                                               |
                                          SQLite + JSONL audit
 ```
@@ -26,13 +29,13 @@ The bot verifies the Hermes UID using Linux `SO_PEERCRED`. The root executor ver
 
 Requires Python 3.12 or newer. The executor uses only the Python standard library. The live bot needs `discord.py`; the unit tests and dry-run relay do not.
 
-For an isolated installation, create a Python virtual environment and install `.` for the executor or `.[bot]` for the Discord relay. The package exposes `deadbolt-executor` and `deadbolt-bot` commands.
+For an isolated installation, create a Python virtual environment and install `.` for the executor or `.[bot]` for the Discord relay. The package exposes `deadbolt-executor`, `deadbolt-emergency-restore`, and `deadbolt-bot` commands.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-The local unit tests use temporary SQLite files, a fake UFW runner, and a mocked body-capture helper. They never alter the host firewall, contact Discord, or invoke the real helper. The bot's `--dry-run` option prints approval cards without a token; it does not approve requests or change host policy. Running that relay still requires the dedicated Unix accounts and socket directories; use the unit tests for development on an ordinary workstation.
+The local unit tests use temporary SQLite files, fake UFW and nftables runners, and a mocked body-capture helper. They never alter the host firewall or contact Discord. The bot's `--dry-run` option prints approval cards without a token; it does not approve requests or change host policy. Running that relay still requires the dedicated Unix accounts and socket directories.
 
 ## GitHub Actions verification
 
@@ -40,22 +43,22 @@ The badge at the top shows the latest **push** result for [Deadbolt CI](.github/
 
 | Check | What it exercises | Runs on |
 | --- | --- | --- |
-| Unit | Policy, state, recovery, mocked Discord approval interactions, and mocked body-capture helper | Pull requests and pushes |
+| Unit | Policy, emergency state and recovery, exclusion matching, mocked Discord approvals, and capture helper | Pull requests and pushes |
 | Unix sockets | Real `hermes` and `deadbolt` users, peer credentials, dry-run relay, denial, and audit records | Pushes |
 | systemd restarts | Shipped service units, runtime-directory ownership, executor and bot restarts, and Hermes ingress recovery | Pushes and same-repository pull requests |
-| UFW | Tagged rule application and rollback in a network-isolated Docker container | Pushes |
+| Firewall | UFW tagged-rule rollback and a real dedicated nftables kill-switch rule in network-isolated Docker containers | Pushes |
 
 Each job uses a fresh GitHub-hosted runner. No bot token, Discord server, Hermes host, or Argus service is involved.
 
-These checks are useful before lab testing, but they do not establish that a live Discord interaction works on the target host. The systemd restart job also runs for pull requests whose head branch belongs to this repository; fork pull requests run the unit suite without executing their code as root.
+These checks are useful before lab testing, but they do not establish that a live Discord interaction or the deployed proxy's exclusion behavior works on Hermes. The systemd restart job also runs for pull requests whose head branch belongs to this repository; fork pull requests run the unit suite without executing their code as root.
 
 ## How to use it on a controlled test host
 
 Use a disposable or otherwise controlled Linux host for the first end-to-end test. The following describes the intended operator sequence; it does not change Hermes or Argus.
 
-1. Ensure Python 3.12+, UFW, `systemd`, and the Unix user and group `hermes` exist. Create a separate non-login `deadbolt` service user and group with no sudo or privileged supplementary groups. Leave the interactive `zeus` account alone. Install a pinned Deadbolt checkout or wheel into a root-owned virtual environment at `/opt/deadbolt/venv`; install the `bot` extra there for `discord.py`. Neither `hermes` nor `deadbolt` should be able to edit that environment.
+1. Ensure Python 3.12+, UFW, nftables, `systemd`, and the Unix user and group `hermes` exist. Create a separate non-login `deadbolt` service user and group with no sudo or privileged supplementary groups. Leave the interactive `zeus` account alone. Install a pinned Deadbolt checkout or wheel into a root-owned virtual environment at `/opt/deadbolt/venv`; install the `bot` extra there for `discord.py`. Neither `hermes` nor `deadbolt` should be able to edit that environment.
 2. Copy `examples/executor.toml`, `examples/profiles.toml`, and `examples/bot.env` into `/etc/deadbolt/` as root-owned files with mode `0600`. Replace every Discord ID and the token in those private copies. Use the same user, guild, and channel IDs in both the executor and bot configurations. Add only reviewed, narrow UFW profiles to `profiles.toml`; the example file permits no action as shipped. Keep all three files out of Git.
-3. Install the two service units from `systemd/` under `/etc/systemd/system/`, and install `systemd/deadbolt-tmpfiles.conf` as `/etc/tmpfiles.d/deadbolt.conf`. Run `systemd-tmpfiles --create /etc/tmpfiles.d/deadbolt.conf`, then `systemctl daemon-reload`. Start `deadbolt-executor.service` first and `deadbolt-bot.service` second. The unit files expect the virtual environment at the path above. Verify the executor is root, the bot is `deadbolt`, and `/run/deadbolt/bot.sock` is `root:deadbolt` mode `0660`. The executor preserves `/run/deadbolt` on restart so systemd does not remove the bot-owned ingress directory; an explicit executor restart also restarts the bot. After either restart, verify both sockets and the ingress directory ownership before accepting requests.
+3. Install the two Deadbolt service units from `systemd/` under `/etc/systemd/system/`, `systemd/deadbolt-tmpfiles.conf` as `/etc/tmpfiles.d/deadbolt.conf`, and the proxy dependency drop-in as `/etc/systemd/system/hermes-tls-proxy.service.d/deadbolt.conf`. Run `systemd-tmpfiles --create /etc/tmpfiles.d/deadbolt.conf`, then `systemctl daemon-reload`. Start `deadbolt-executor.service` first and `deadbolt-bot.service` second. The executor runs `deadbolt-emergency-restore` before it starts; the drop-in prevents proxy startup if restoration fails. Verify the executor is root, the bot is `deadbolt`, and `/run/deadbolt/bot.sock` is `root:deadbolt` mode `0660`. After either service restarts, verify both sockets and ingress ownership.
 4. From a process running **as `hermes`**, submit a named profile. The installed Python package includes a small socket client helper; it adds the protocol version automatically:
 
    ```sh
@@ -75,7 +78,7 @@ Use a disposable or otherwise controlled Linux host for the first end-to-end tes
    PY
    ```
 
-5. The bot posts the root-generated rule description to the configured Discord channel. Check the profile, network, port, reason, and effective TTL on the card before selecting **Approve** or **Deny**. Only the configured Discord user can decide, and the card expires after ten minutes. `/deadbolt status <request-id>` shows the current state; `/deadbolt deny <request-id>` is available if the card button cannot be used. There is no slash-command approval fallback in v0.5.
+5. The bot posts the root-generated rule description to the configured Discord channel. Check the profile, network, port, reason, and effective TTL on the card before selecting **Approve** or **Deny**. Only the configured Discord user can decide, and the card expires after ten minutes. `/deadbolt status <request-id>` shows the current state; `/deadbolt deny <request-id>` is available if the card button cannot be used. There is no slash-command approval fallback.
 6. On approval, inspect `ufw show added` for the unique `deadbolt:<request-id>` comment and check `/var/log/deadbolt/audit.jsonl` or `journalctl -u deadbolt-executor.service` for the grant event. When the active TTL elapses, the executor should remove only its tagged rule and the request should become `rolled_back`. On denial or pending expiry, UFW should remain unchanged. A rollback failure stays visible in state and audit records for operator attention.
 
 For a token-free relay check, run `deadbolt-bot --dry-run` as the `deadbolt` user while the executor is running, instead of starting the Discord bot service. It prints cards to stdout and cannot approve them. It still requires the same Unix socket directories and root configuration. Never run the bot as `zeus` or root.
@@ -102,19 +105,23 @@ Install the versioned helper, its **independent** expiry timer, and the rotation
 
 `hours` must be an integer from 1 through 24. Every enable requires a new Discord approval; the card shows the requested duration and warns that decrypted HTTP request and response bodies are retained on Argus for 24 hours. Deadbolt invokes only `/usr/local/sbin/hermes-body-capture --json enable HOURS`. The helper returns a single compact JSON line with exactly `enabled`, `expires_at` (whole-second RFC3339 UTC or null), and `outcome` (`enabled`, `disabled`, `status`, `expired`, `invalid_ttl`, or `internal_error`). Deadbolt records the helper's expiry, which replaces any prior expiry; it never extends from the old deadline. The helper and its root-owned systemd timer enforce expiry independently of Deadbolt. The helper serializes concurrent calls, and an enabled state with an invalid expiry is disabled by `status` or the timer. Loki retention remains an Argus-side configuration.
 
-Only the configured Discord operator may use `/deadbolt capture_status` and `/deadbolt capture_disable`. These commands call the fixed helper `--json status` and `--json disable` forms without a second approval. Hermes cannot reach them through the ingress socket. The bot and audit log receive only the validated structured result; helper stderr and raw output are discarded. Deadbolt deliberately does not persist or display Hermes's freeform reason for body-capture and exclusion requests, preventing accidental evidence or secret URLs from appearing in cards or audit records.
+Only the configured Discord operator may use `/deadbolt capture_status` and `/deadbolt capture_disable`. These commands call the fixed helper `--json status` and `--json disable` forms without a second approval. Hermes cannot reach them through the ingress socket. The bot and audit log receive only the validated structured result; helper stderr and raw output are discarded. Deadbolt deliberately does not persist or display Hermes's freeform body-capture reason, preventing accidental evidence or secret URLs from appearing in cards or audit records. A failed five-second helper lock attempt returns only the fixed JSON `internal_error` result.
 
 ### Body-only exclusions
 
-Install [the sample exclusion file](examples/body-capture-exclusions.conf) as `/etc/hermes-inspection-proxy/body-capture-exclusions.conf`, owned by `root:tlsproxy` with mode `0640`. It starts with `discord.com`, `discordapp.com`, `discordapp.net`, and `discordcdn.com`. The external proxy reads normalized DNS suffixes from this file, matches TLS SNI first and then HTTP Host, and suppresses **only** request and response body evidence for matching hosts. It must still proxy the traffic, retain metadata, and apply existing firewall rules. No wildcard, regex, IP address, port, URL, CIDR, or proxy-bypass setting is accepted by Deadbolt. The proxy rereads the file; no reload command is run.
+Install [the sample exclusion file](examples/body-capture-exclusions.conf) as `/etc/hermes-inspection-proxy/body-capture-exclusions.conf`, owned by `root:tlsproxy` with mode `0640`. The file starts empty. Each non-comment line is one normalized **exact** DNS hostname. The root-owned `[body_capture_exclusions] allowed_hosts` policy also starts empty. An administrator must first review and add an exact hostname to that policy; the configured operator can then request `/deadbolt exclusion_add <hostname>` or `/deadbolt exclusion_remove <hostname>`. Each command creates a separate Discord approval card showing the specific change and complete resulting list. The root executor binds that list and the prior file digest to the approval hash, then atomically replaces the fixed file only if its prior contents still match. Hermes ingress cannot request either edit.
 
-Later changes require a **separate approval**. The root-owned `[body_capture_exclusions] allowed_suffixes` policy limits which suffixes may be selected. A submitted replacement list uses this shape:
+The external proxy must use TLS SNI when present. If SNI is present but does not exactly match a listed hostname, it must **not** fall back to HTTP Host; normal body capture continues. It may use Host only when SNI is absent. Exact matching never includes subdomains implicitly. Exclusions suppress **only request and response body evidence**; the proxy must still route the traffic and retain DNS, connection metadata, firewall decisions, and audit records. [The reference matcher](src/deadbolt/exclusion_match.py) and its tests define this contract, but this repository does not contain the deployed proxy implementation. Verify the proxy behavior before using an approved exclusion. The proxy rereads the file, so Deadbolt runs no reload command.
 
-```json
-{"version":1,"op":"submit","action":"body_capture_exclusions","profile":"body_capture_exclusions","reason":"reduce noise","suffixes":["discord.com","discordcdn.com"]}
-```
+No LLM provider is preapproved. Add external providers only after reviewing their current exact hostnames and updating root-owned policy. For a local LLM, establish a stable internal FQDN such as `llm.home.arpa` before adding it. Migrating a v0.5 suffix file requires a deliberate root-owned file and proxy update; do not reinterpret old suffix entries as exact-host approvals.
 
-Root canonicalizes and displays the full replacement list before approval, then atomically replaces only the fixed exclusion file. This is a permanent configuration edit with no active TTL; it never calls an arbitrary command. To permit a new hostname, an administrator must first add it to the root-owned policy. The example policy permits only the four initial Discord suffixes.
+### Emergency stop and recovery
+
+Only the configured Discord operator may run `/deadbolt emergency_stop` and `/deadbolt emergency_status`. Stop is idempotent: the root executor installs a dedicated `inet deadbolt_killswitch` nftables output rule dropping traffic whose socket UID is `hermes`, then stops `hermes-tls-proxy.service` and only optional units named in root-owned `[emergency_stop] workload_units` (empty by default). It records which units were active before stopping them. It does not stop `deadbolt-*` or `alloy.service`; their separate UIDs can continue delivering evidence. Hermes cannot reach these operations through its ingress socket.
+
+Connectivity returns only after `/deadbolt emergency_recover` creates a **separate approval card** and the operator approves it. Recovery starts only the recorded previously active proxy and optional units, then removes the owned nftables table. A failed recovery reasserts the stop and remains audited. The root-owned state survives executor restart and reboot; `deadbolt-emergency-restore` reapplies the block in `ExecStartPre`. Install the shipped proxy dependency drop-in so the proxy cannot start if restoration fails. The local `/var/log/deadbolt/audit.jsonl` stream records requests, approvals, stop/recovery transitions, and failures; the existing root-owned `deadbolt-audit-relay.service` copies it to `/var/lib/alloy/deadbolt-audit/audit.jsonl`, which Alloy ships to Argus Loki with `source="deadbolt-audit"`. This release does not modify Alloy or Argus configuration.
+
+The independent last-resort kill switch is **hypervisor power-off**. Deadbolt's software stop assumes the host kernel, root-owned state, nftables, and systemd remain trustworthy.
 
 Pending approval expires after 10 minutes. UFW active TTL starts after successful application, defaults to 30 minutes, and is capped at 60 minutes and by the chosen profile. Expired UFW grants are swept every five seconds; startup reconciliation runs before the executor accepts requests. If rollback fails, the record stays recoverable and the executor retries. Body-capture expiry is enforced by the external helper and timer, not by the Deadbolt sweep.
 
@@ -122,7 +129,7 @@ Pending approval expires after 10 minutes. UFW active TTL starts after successfu
 
 Sanitized configuration lives in `examples/`; systemd templates live in `systemd/`; the capture helper lives in `scripts/`; log rotation templates live in `logrotate/`. Production configuration belongs only in `/etc/deadbolt/`, with root-owned policy, state, and audit paths. The `deadbolt` account must be a dedicated non-login user with no sudo or privileged supplementary groups. `zeus` remains the human/operator account and is not used by the bot. The root executor is the only privileged Deadbolt process. The ingress directory is `deadbolt:hermes` mode `0750`; its socket is mode `0666` *inside that private directory* and still checks the peer UID. The root socket is `root:deadbolt` mode `0660` under a root-owned runtime directory.
 
-Install and run the tmpfiles definition before starting the units. It creates the private ingress directory and the UFW and iptables lock files needed by the executor's `ProtectSystem=strict` sandbox. When testing body capture, ensure `/etc/hermes-inspection-proxy` exists. The executor unit permits atomic writes there for the fixed helper and approved exclusion file; the path is optional so UFW-only hosts can still start the unit.
+Install and run the tmpfiles definition before starting the units. It creates the private ingress directory and the UFW and iptables lock files needed by the executor's `ProtectSystem=strict` sandbox. Install `nftables` before starting the executor. Place `systemd/hermes-tls-proxy-deadbolt.conf` at `/etc/systemd/system/hermes-tls-proxy.service.d/deadbolt.conf` and reload systemd before testing reboot recovery. When testing body capture, ensure `/etc/hermes-inspection-proxy` exists. The executor unit permits atomic writes there for the fixed helper and approved exclusion file; the path is optional on UFW-only hosts.
 
 ### Versioned capture host files
 
@@ -143,7 +150,7 @@ The helper writes `/etc/hermes-inspection-proxy/evidence.env` by atomic replacem
 
 Deployment source should be a pinned release under `/opt/deadbolt`, owned by root and not writable by `hermes` or `deadbolt`. Review concrete root-owned UFW profiles, Discord IDs, and service permissions before rollout.
 
-Teleport identity issuance, renewal, and revocation are disabled in v0.5. Service actions have no permitted profiles. Existing Teleport session recording and Argus telemetry are external to Deadbolt; this project does not change them.
+Teleport identity issuance, renewal, and revocation remain disabled. Generic service actions have no permitted profiles. Existing Teleport session recording and Argus telemetry are external to Deadbolt; this project does not change them.
 
 ## License
 

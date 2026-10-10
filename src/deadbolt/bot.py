@@ -60,9 +60,11 @@ class Relay:
     async def submit(self, message: dict[str, Any], uid: int) -> dict[str, Any]:
         if uid != self.hermes_uid:
             raise ProtocolError("unauthorized Unix peer")
-        require_fields(message, {"op", "action", "profile", "reason"}, {"ttl_seconds", "hours", "suffixes"})
+        require_fields(message, {"op", "action", "profile", "reason"}, {"ttl_seconds", "hours"})
         if message["op"] != "submit":
             raise ProtocolError("Hermes may only submit requests")
+        if message["action"] not in ("firewall_profile", "proxy_body_capture"):
+            raise ProtocolError("Hermes action is not available")
         if any(not isinstance(message[key], str) for key in ("action", "profile", "reason")):
             raise ProtocolError("invalid request fields")
         payload = {"op": "create", "action": message["action"], "profile": message["profile"],
@@ -71,8 +73,6 @@ class Relay:
             payload["ttl_seconds"] = message["ttl_seconds"]
         if "hours" in message:
             payload["hours"] = message["hours"]
-        if "suffixes" in message:
-            payload["suffixes"] = message["suffixes"]
         return await self.root(payload)
 
     async def connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -117,6 +117,24 @@ class Relay:
         return (await self.root({"op": operation, "interaction_id": interaction_id,
                                  "user_id": user_id, "guild_id": guild_id,
                                  "channel_id": channel_id}))["capture"]
+
+    async def request_exclusion(self, operation: str, hostname: str, interaction_id: str,
+                                user_id: str, guild_id: str, channel_id: str) -> dict[str, Any]:
+        if operation not in ("add", "remove"):
+            raise ProtocolError("invalid exclusion operation")
+        return (await self.root({"op": "exclusion_create", "operation": operation,
+                                 "hostname": hostname, "interaction_id": interaction_id,
+                                 "user_id": user_id, "guild_id": guild_id,
+                                 "channel_id": channel_id}))["request"]
+
+    async def emergency_operator(self, operation: str, interaction_id: str, user_id: str,
+                                 guild_id: str, channel_id: str) -> dict[str, Any]:
+        if operation not in ("emergency_status", "emergency_stop", "emergency_recover_create"):
+            raise ProtocolError("invalid emergency operation")
+        response = await self.root({"op": operation, "interaction_id": interaction_id,
+                                    "user_id": user_id, "guild_id": guild_id,
+                                    "channel_id": channel_id})
+        return response["request"] if operation == "emergency_recover_create" else response["emergency"]
 
     async def decide(self, row: dict[str, Any], decision: str, interaction_id: str,
                      user_id: str, guild_id: str, channel_id: str) -> dict[str, Any]:
@@ -323,6 +341,61 @@ async def run_discord(config: BotConfig) -> None:
     @group.command(name="capture_disable", description="Disable body capture now")
     async def capture_disable_cmd(interaction: discord.Interaction) -> None:
         await capture_command(interaction, "capture_disable")
+
+    async def exclusion_command(interaction: discord.Interaction, operation: str,
+                                hostname: str) -> None:
+        if not allowed(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            row = await relay.request_exclusion(operation, hostname, str(interaction.id),
+                str(interaction.user.id), str(interaction.guild_id), str(interaction.channel_id))
+            await interaction.followup.send(
+                f"Exclusion {operation} request {row['id']} queued for a separate approval card.",
+                ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            await interaction.followup.send(f"Exclusion request rejected: {exc}", ephemeral=True)
+
+    @group.command(name="exclusion_add", description="Request an exact-host body exclusion")
+    async def exclusion_add_cmd(interaction: discord.Interaction, hostname: str) -> None:
+        await exclusion_command(interaction, "add", hostname)
+
+    @group.command(name="exclusion_remove", description="Request removal of a body exclusion")
+    async def exclusion_remove_cmd(interaction: discord.Interaction, hostname: str) -> None:
+        await exclusion_command(interaction, "remove", hostname)
+
+    async def emergency_command(interaction: discord.Interaction, operation: str) -> None:
+        if not allowed(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await relay.emergency_operator(operation, str(interaction.id),
+                str(interaction.user.id), str(interaction.guild_id), str(interaction.channel_id))
+            if operation == "emergency_recover_create":
+                message = f"Recovery request {result['id']} queued for a separate approval card."
+            else:
+                message = (f"Emergency switch: {result['state']}; Hermes direct-egress block: "
+                           f"{'enforced' if result['egress_block_enforced'] else 'absent'}; "
+                           f"running watched units: {', '.join(result['running_units']) or 'none'}; "
+                           f"generation: {result['generation']}.")
+            await interaction.followup.send(message, ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            await interaction.followup.send(f"Emergency command failed: {exc}", ephemeral=True)
+
+    @group.command(name="emergency_status", description="Show Hermes emergency switch status")
+    async def emergency_status_cmd(interaction: discord.Interaction) -> None:
+        await emergency_command(interaction, "emergency_status")
+
+    @group.command(name="emergency_stop", description="Stop Hermes proxy and block Hermes direct egress")
+    async def emergency_stop_cmd(interaction: discord.Interaction) -> None:
+        await emergency_command(interaction, "emergency_stop")
+
+    @group.command(name="emergency_recover", description="Request separately approved Hermes recovery")
+    async def emergency_recover_cmd(interaction: discord.Interaction) -> None:
+        await emergency_command(interaction, "emergency_recover_create")
 
     bot.tree.add_command(group, guild=guild)
 

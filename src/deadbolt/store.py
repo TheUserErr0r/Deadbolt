@@ -49,6 +49,14 @@ class Store:
             CREATE TABLE IF NOT EXISTS operator_audit_outbox (
                 id TEXT PRIMARY KEY, payload TEXT NOT NULL, flushed INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS emergency_switch (
+                id INTEGER PRIMARY KEY CHECK(id=1), state TEXT NOT NULL,
+                generation INTEGER NOT NULL, workload_units_json TEXT NOT NULL,
+                previously_active_json TEXT NOT NULL, updated_at REAL NOT NULL
+            );
+            INSERT OR IGNORE INTO emergency_switch
+                (id,state,generation,workload_units_json,previously_active_json,updated_at)
+                VALUES(1,'inactive',0,'[]','[]',0);
             CREATE INDEX IF NOT EXISTS requests_status ON requests(status);
             CREATE INDEX IF NOT EXISTS audit_unflushed ON audit_outbox(flushed);
             CREATE INDEX IF NOT EXISTS operator_audit_unflushed ON operator_audit_outbox(flushed);
@@ -87,6 +95,62 @@ class Store:
                   AND status='active' ORDER BY approved_at DESC LIMIT 1""").fetchone()
         return row["id"] if row else None
 
+    def emergency_state(self) -> dict[str, Any]:
+        row = self.db.execute("SELECT * FROM emergency_switch WHERE id=1").fetchone()
+        return {"state": row["state"], "generation": row["generation"],
+                "workload_units": json.loads(row["workload_units_json"]),
+                "previously_active": json.loads(row["previously_active_json"]),
+                "updated_at": row["updated_at"]}
+
+    def emergency_event(self, event: str, now: float, *, operator_id: str | None = None,
+                        interaction_id: str | None = None, request_id: str | None = None,
+                        error: str | None = None, state_before: str | None = None,
+                        state_after: str | None = None) -> None:
+        with self.db:
+            self._queue_emergency_event(event, now, operator_id=operator_id,
+                interaction_id=interaction_id, request_id=request_id, error=error,
+                state_before=state_before, state_after=state_after)
+
+    def _queue_emergency_event(self, event: str, now: float, *, operator_id: str | None = None,
+                               interaction_id: str | None = None, request_id: str | None = None,
+                               error: str | None = None, state_before: str | None = None,
+                               state_after: str | None = None) -> None:
+        state = self.emergency_state()
+        record = {"event_id": str(uuid.uuid4()),
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                  "event": event, "request_id": request_id,
+                  "approved_by_discord_id": operator_id, "interaction_id": interaction_id,
+                  "state_before": state_before, "state_after": state_after or state["state"],
+                  "generation": state["generation"],
+                  "workload_units": state["workload_units"],
+                  "previously_active": state["previously_active"]}
+        if error is not None:
+            record["error"] = error[:200]
+        self.db.execute("INSERT INTO operator_audit_outbox(id,payload) VALUES(?,?)",
+                        (record["event_id"], canonical_json(record)))
+
+    def emergency_transition(self, expected: tuple[str, ...], state: str, event: str, now: float,
+                             *, operator_id: str | None = None, interaction_id: str | None = None,
+                             request_id: str | None = None, workload_units: tuple[str, ...] | None = None,
+                             previously_active: tuple[str, ...] | None = None,
+                             next_generation: bool = False) -> dict[str, Any]:
+        if state not in ("inactive", "stopping", "active", "recovering"):
+            raise StateError("invalid emergency state")
+        with self.db:
+            before = self.emergency_state()
+            if before["state"] not in expected:
+                raise StateError("invalid emergency state transition")
+            generation = before["generation"] + int(next_generation)
+            units = list(workload_units) if workload_units is not None else before["workload_units"]
+            active = list(previously_active) if previously_active is not None else before["previously_active"]
+            self.db.execute("""UPDATE emergency_switch SET state=?,generation=?,
+                              workload_units_json=?,previously_active_json=?,updated_at=? WHERE id=1""",
+                            (state, generation, canonical_json(units), canonical_json(active), now))
+            self._queue_emergency_event(event, now, operator_id=operator_id,
+                interaction_id=interaction_id, request_id=request_id,
+                state_before=before["state"], state_after=state)
+        return self.emergency_state()
+
     def get(self, request_id: str) -> sqlite3.Row:
         try:
             uuid.UUID(request_id)
@@ -97,7 +161,8 @@ class Store:
             raise StateError("unknown request")
         return row
 
-    def create(self, canonical: dict[str, Any], description: str, requested_by_uid: int, now: float) -> sqlite3.Row:
+    def create(self, canonical: dict[str, Any], description: str, requested_by_uid: int, now: float,
+               requested_by_discord_id: str | None = None) -> sqlite3.Row:
         request_id = str(uuid.uuid4())
         nonce = secrets.token_urlsafe(18)
         serialized = canonical_json(canonical)
@@ -117,7 +182,9 @@ class Store:
                  requested_by_uid, serialized, digest, card, nonce, now, deadline))
             self._event(request_id, "request_created", now, action=canonical["action"],
                         profile=canonical["profile"], ttl_seconds=canonical["ttl_seconds"],
-                        requested_by_uid=requested_by_uid, canonical_hash=digest)
+                        requested_by_uid=requested_by_uid, requested_by_discord_id=requested_by_discord_id,
+                        operation=canonical.get("operation"), hostname=canonical.get("hostname"),
+                        resulting_hosts=canonical.get("hosts"), canonical_hash=digest)
         return self.get(request_id)
 
     def list_state(self, state: str, offset: int = 0, limit: int = 10) -> list[sqlite3.Row]:
@@ -163,9 +230,12 @@ class Store:
             status = "approved" if decision == "approve" else "denied"
             self.db.execute("""UPDATE requests SET status=?,approved_by_discord_id=?,interaction_id=?,
                               approved_at=? WHERE id=?""", (status, user_id, interaction_id, now, request_id))
+            canonical = json.loads(row["canonical_json"])
             self._event(request_id, "approval_granted" if decision == "approve" else "approval_denied", now,
                         action=row["action"], profile=row["profile"],
-                        approved_by_discord_id=user_id, canonical_hash=canonical_hash)
+                        approved_by_discord_id=user_id, canonical_hash=canonical_hash,
+                        operation=canonical.get("operation"), hostname=canonical.get("hostname"),
+                        resulting_hosts=canonical.get("hosts"))
         return self.get(request_id)
 
     def mark_executing(self, request_id: str, rollback: dict[str, Any], now: float) -> sqlite3.Row:
@@ -200,8 +270,11 @@ class Store:
             if row["status"] != "executing":
                 raise StateError("request is not executing")
             self.db.execute("UPDATE requests SET status='completed' WHERE id=?", (request_id,))
+            canonical = json.loads(row["canonical_json"])
             self._event(request_id, "configuration_applied", now, action=row["action"],
-                        approved_by_discord_id=row["approved_by_discord_id"], outcome=outcome)
+                        approved_by_discord_id=row["approved_by_discord_id"], outcome=outcome,
+                        operation=canonical.get("operation"), hostname=canonical.get("hostname"),
+                        resulting_hosts=canonical.get("hosts"))
         return self.get(request_id)
 
     def mark_failed(self, request_id: str, error: str, now: float,
@@ -212,6 +285,10 @@ class Store:
                 raise StateError("request cannot fail from this state")
             self.db.execute("UPDATE requests SET status='failed',last_error=? WHERE id=?", (error[:200], request_id))
             fields = {"error": error[:200]}
+            canonical = json.loads(row["canonical_json"])
+            fields.update(action=row["action"], operation=canonical.get("operation"),
+                          hostname=canonical.get("hostname"),
+                          requested_hosts=canonical.get("hosts"))
             if helper_outcome is not None:
                 fields["helper_outcome"] = helper_outcome
             self._event(request_id, "execution_failed", now, **fields)

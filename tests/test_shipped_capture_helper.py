@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import fcntl
 import json
 from pathlib import Path
 import subprocess
@@ -40,7 +41,7 @@ class ShippedCaptureHelperTests(unittest.TestCase):
 
     def call(self, *args: str) -> tuple[subprocess.CompletedProcess[str], dict[str, object] | None]:
         result = subprocess.run(["/bin/sh", str(self.helper), *args], capture_output=True,
-                                text=True, timeout=5)
+                                text=True, timeout=8)
         return result, json.loads(result.stdout) if "--json" in args and result.stdout else None
 
     def test_enable_replaces_expiry_and_status_disable_are_idempotent(self) -> None:
@@ -72,6 +73,17 @@ class ShippedCaptureHelperTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(response, {"enabled": False, "expires_at": None,
                                             "outcome": "invalid_ttl"})
+        self.assertEqual(self.config.read_text().splitlines()[0], "HERMES_CAPTURE_BODIES=false")
+        self.assertFalse(self.restarts.exists())
+
+    def test_lock_contention_returns_fixed_json_error(self) -> None:
+        with (self.base / "lock").open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result, response = self.call("--json", "enable", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(response, {"enabled": False, "expires_at": None,
+                                    "outcome": "internal_error"})
         self.assertEqual(self.config.read_text().splitlines()[0], "HERMES_CAPTURE_BODIES=false")
         self.assertFalse(self.restarts.exists())
 

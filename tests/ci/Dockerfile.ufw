@@ -1,9 +1,10 @@
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive PYTHONPATH=/app/src
-RUN apt-get update && apt-get install -y --no-install-recommends python3 ufw iptables \
+RUN apt-get update && apt-get install -y --no-install-recommends python3 ufw iptables nftables \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY src/ /app/src/
 COPY tests/ci/ufw_live.py /app/ufw_live.py
+COPY tests/ci/nft_live.py /app/nft_live.py
 CMD ["python3", "/app/ufw_live.py"]

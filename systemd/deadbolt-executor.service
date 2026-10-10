@@ -1,11 +1,13 @@
 [Unit]
 Description=Deadbolt root approval executor
 After=local-fs.target
+Before=hermes-tls-proxy.service
 
 [Service]
 Type=simple
 User=root
 Group=root
+ExecStartPre=/opt/deadbolt/venv/bin/deadbolt-emergency-restore --config /etc/deadbolt/executor.toml
 ExecStart=/opt/deadbolt/venv/bin/deadbolt-executor --config /etc/deadbolt/executor.toml
 Restart=on-failure
 RestartSec=3s
