@@ -44,6 +44,15 @@ class FakeUfw:
         self.calls: list[list[str]] = []
         self.fail_next_allow = False
         self.active = True
+        self.normalize_rules = False
+
+    def _stored_rule(self, command: list[str]) -> list[str]:
+        if not self.normalize_rules:
+            return command
+        # UFW 0.36 rewrites this test profile into the order shown by
+        # `ufw show added`, regardless of the argv order used to add it.
+        comment = command[command.index("comment"):] if "comment" in command else []
+        return ["allow", "out", "to", "192.0.2.0/24", "port", "22", "proto", "tcp", *comment]
 
     def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         self.calls.append(argv[:])
@@ -58,10 +67,10 @@ class FakeUfw:
             if self.fail_next_allow:
                 self.fail_next_allow = False
                 return subprocess.CompletedProcess(argv, 1, "", "simulated failure")
-            self.rules.append(command)
+            self.rules.append(self._stored_rule(command))
             return subprocess.CompletedProcess(argv, 0, "", "")
         if command[:1] == ["delete"]:
-            rule = command[1:]
+            rule = self._stored_rule(command[1:])
             if rule in self.rules:
                 self.rules.remove(rule)
                 return subprocess.CompletedProcess(argv, 0, "", "")
@@ -161,6 +170,26 @@ class UfwTests(unittest.TestCase):
         self.assertEqual(self.fake.rules, [])
         self.assertTrue(all(call[0] == "/usr/sbin/ufw" for call in self.fake.calls))
         self.assertFalse(any("Need test access" in " ".join(call) for call in self.fake.calls))
+
+    def test_real_ufw_normalized_output_round_trip(self) -> None:
+        self.fake.normalize_rules = True
+        intent = self.action.prepare(self.request, "00000000-0000-4000-8000-000000000001")
+        self.action.apply(self.request, intent)
+        self.assertEqual(self.fake.rules[0][:-2],
+                         ["allow", "out", "to", "192.0.2.0/24", "port", "22", "proto", "tcp"])
+        self.action.rollback(self.request, intent)
+        self.assertEqual(self.fake.rules, [])
+
+    def test_inbound_and_interface_rule_formats(self) -> None:
+        inbound = {**self.request, "direction": "in", "source": "192.0.2.1/32",
+                   "destination": "any", "port": "443"}
+        self.assertEqual(self.action._rule(inbound),
+                         ["allow", "from", "192.0.2.1/32", "to", "any", "port", "443", "proto", "tcp"])
+        interface = {**self.request, "interface": "eth0", "protocol": "udp",
+                     "destination": "2001:db8::/64", "port": "8000:8002"}
+        self.assertEqual(self.action._rule(interface),
+                         ["allow", "out", "on", "eth0", "to", "2001:db8::/64",
+                          "port", "8000:8002", "proto", "udp"])
 
     def test_existing_rule_is_untouched(self) -> None:
         rule = self.action._rule(self.request)
@@ -320,6 +349,27 @@ class RelayTests(unittest.TestCase):
         asyncio.run(relay.submit(message, 102))
         self.assertEqual(sent[0]["requested_by_uid"], 102)
         self.assertNotIn("command", sent[0])
+
+    def test_new_card_decision_uses_posted_message_id(self) -> None:
+        sent: list[dict[str, object]] = []
+        card = {"id": "request-one", "nonce": "one-time", "canonical_hash": "hash",
+                "posted_message_id": None}
+        posted = {**card, "posted_message_id": "44"}
+
+        async def fake_rpc(path: str, payload: dict[str, object]) -> dict[str, object]:
+            sent.append(payload)
+            if payload["op"] == "list":
+                return {"ok": True, "requests": [posted]}
+            return {"ok": True, "request": {"status": "active"}}
+
+        cfg = BotConfig(Path("/tmp/hermes.sock"), Path("/tmp/bot.sock"), "hermes", "1", "2", "3", None, True)
+        with patch("deadbolt.bot.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=102)):
+            relay = Relay(cfg, fake_rpc)
+        result = asyncio.run(relay.decide_posted(card, "approve", "44", "55", "1", "2", "3"))
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(sent[-1]["message_id"], "44")
+        with self.assertRaises(ProtocolError):
+            asyncio.run(relay.decide_posted(card, "approve", "45", "56", "1", "2", "3"))
 
 
 class StaticSafetyTests(unittest.TestCase):

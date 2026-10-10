@@ -47,11 +47,22 @@ class UfwAction:
         return describe_action(request)
 
     def _rule(self, request: dict[str, Any]) -> list[str]:
-        rule = ["allow", str(request["direction"])]
+        # Match the form emitted by `ufw show added`. UFW rewrites input rules
+        # into this form; comparing against the input argv would miss a rule
+        # after it had already been applied.
+        rule = ["allow"]
         if request["interface"]:
-            rule += ["on", str(request["interface"])]
-        rule += ["proto", str(request["protocol"]), "from", str(request["source"]),
-                 "to", str(request["destination"]), "port", str(request["port"])]
+            rule += [str(request["direction"]), "on", str(request["interface"])]
+        elif request["direction"] == "out":
+            rule += ["out"]
+        source = str(request["source"])
+        destination = str(request["destination"])
+        if source not in ("any", "0.0.0.0/0", "::/0"):
+            rule += ["from", source]
+        if destination in ("0.0.0.0/0", "::/0"):
+            destination = "any"
+        rule += ["to", destination, "port", str(request["port"]),
+                 "proto", str(request["protocol"])]
         return rule
 
     def _run(self, args: list[str]) -> str:

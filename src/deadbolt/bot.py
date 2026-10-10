@@ -114,6 +114,19 @@ class Relay:
                                  "message_id": row["posted_message_id"],
                                  "interaction_id": interaction_id}))["request"]
 
+    async def decide_posted(self, card: dict[str, Any], decision: str, message_id: str,
+                            interaction_id: str, user_id: str, guild_id: str,
+                            channel_id: str) -> dict[str, Any]:
+        # A view is created before Discord assigns the message ID. Fetch the
+        # posted record at click time so its decision uses the actual ID.
+        rows = await self.list_all("posted")
+        current = next((row for row in rows if row["id"] == card["id"]), None)
+        if (current is None or current["posted_message_id"] != message_id
+                or current["nonce"] != card["nonce"]
+                or current["canonical_hash"] != card["canonical_hash"]):
+            raise ProtocolError("approval card no longer matches posted request")
+        return await self.decide(current, decision, interaction_id, user_id, guild_id, channel_id)
+
     async def serve_ingress(self) -> asyncio.AbstractServer:
         if os.geteuid() == 0 or pwd.getpwuid(os.geteuid()).pw_name != "deadbolt":
             raise RuntimeError("bot must run as dedicated non-root deadbolt user")
@@ -202,14 +215,15 @@ async def run_discord(config: BotConfig) -> None:
                 custom_id=f"deadbolt:{decision}:{row['id']}:{row['nonce']}")
 
             async def callback(interaction: discord.Interaction, choice: str = decision) -> None:
-                if not allowed(interaction) or not interaction.message or str(interaction.message.id) != row["posted_message_id"]:
+                if not allowed(interaction) or not interaction.message:
                     await interaction.response.send_message("Not authorized for this approval.", ephemeral=True)
                     return
                 await interaction.response.defer(ephemeral=True, thinking=True)
                 try:
-                    updated = await relay.decide(row, choice, str(interaction.id),
-                                                str(interaction.user.id), str(interaction.guild_id),
-                                                str(interaction.channel_id))
+                    updated = await relay.decide_posted(
+                        row, choice, str(interaction.message.id), str(interaction.id),
+                        str(interaction.user.id), str(interaction.guild_id),
+                        str(interaction.channel_id))
                 except Exception as exc:
                     await interaction.followup.send(f"Decision rejected: {exc}", ephemeral=True)
                     return
