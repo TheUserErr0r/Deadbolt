@@ -47,10 +47,13 @@ def submit() -> None:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             response = json.loads(result.stdout)
-            assert response["ok"] is True, response
-            return
+            if response["ok"] is True:
+                return
+            if response.get("error") not in ("[Errno 111] Connection refused",
+                                             "[Errno 2] No such file or directory"):
+                raise AssertionError(response)
         time.sleep(0.2)
-    raise AssertionError(f"Hermes ingress did not recover: {result.stderr}")
+    raise AssertionError(f"Hermes ingress did not recover: {result.stderr or result.stdout}")
 
 
 def assert_runtime() -> int:
