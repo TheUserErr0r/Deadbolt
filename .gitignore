@@ -211,6 +211,17 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Deadbolt local credentials, state, and audit artifacts
+/bot.env
+/executor.toml
+/profiles.toml
+*.pem
+*.key
+*.db
+*.db-*
+*.jsonl
+*.sock
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

@@ -1,0 +1,25 @@
+[Unit]
+Description=Deadbolt root approval executor
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/deadbolt/venv/bin/deadbolt-executor --config /etc/deadbolt/executor.toml
+Restart=on-failure
+RestartSec=3s
+RuntimeDirectory=deadbolt
+RuntimeDirectoryMode=0755
+StateDirectory=deadbolt
+StateDirectoryMode=0700
+LogsDirectory=deadbolt
+LogsDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/run/deadbolt /var/lib/deadbolt /var/log/deadbolt /etc/ufw
+
+[Install]
+WantedBy=multi-user.target

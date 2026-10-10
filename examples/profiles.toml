@@ -1,0 +1,11 @@
+# Root-owned allow-list. Empty by default: no privileged action can be granted.
+[firewall_profiles]
+
+# Replace the destination with an exact approved CIDR before enabling a profile.
+# [firewall_profiles.https-temporary]
+# direction = "out"
+# protocol = "tcp"
+# source = "any"
+# destination = "REPLACE_WITH_APPROVED_CIDR"
+# port = 443
+# max_ttl_seconds = 900
