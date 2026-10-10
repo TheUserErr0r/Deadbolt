@@ -1,0 +1,14 @@
+# Copy to /etc/deadbolt/executor.toml and replace all Discord IDs.
+# Keep this file root-owned and unreadable to deadbolt and hermes.
+[executor]
+state_path = "/var/lib/deadbolt/state.db"
+audit_path = "/var/log/deadbolt/audit.jsonl"
+bot_socket = "/run/deadbolt/bot.sock"
+profiles_path = "/etc/deadbolt/profiles.toml"
+bot_user = "deadbolt"
+hermes_user = "hermes"
+
+[discord]
+user_id = "0"
+guild_id = "0"
+channel_id = "0"

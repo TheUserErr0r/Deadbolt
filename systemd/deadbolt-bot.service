@@ -1,0 +1,24 @@
+[Unit]
+Description=Deadbolt unprivileged Discord relay
+Requires=deadbolt-executor.service
+After=deadbolt-executor.service
+
+[Service]
+Type=simple
+User=deadbolt
+Group=deadbolt
+EnvironmentFile=/etc/deadbolt/bot.env
+ExecStart=/opt/deadbolt/venv/bin/deadbolt-bot
+Restart=on-failure
+RestartSec=5s
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/run/deadbolt/ingress
+
+[Install]
+WantedBy=multi-user.target
