@@ -1,0 +1,11 @@
+/var/log/hermes-proxy/access.jsonl {
+    daily
+    maxsize 100M
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 tlsproxy tlsproxy
+    su tlsproxy tlsproxy
+}

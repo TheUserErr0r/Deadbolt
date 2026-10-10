@@ -194,7 +194,7 @@ class DisabledAction:
 
 
 class CaptureAction:
-    """Adapter for the separately deployed, root-owned body-capture helper."""
+    """Adapter for the versioned, separately installed root-owned helper."""
 
     executable = "/usr/local/sbin/hermes-body-capture"
     outcomes = frozenset({"enabled", "disabled", "status", "expired", "invalid_ttl", "internal_error"})

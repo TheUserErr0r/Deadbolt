@@ -1,0 +1,112 @@
+#!/bin/sh
+# Root-owned integration helper. Install at /usr/local/sbin/hermes-body-capture.
+set -eu
+
+json=false
+if [ "${1:-}" = "--json" ]; then
+  json=true
+  shift
+fi
+
+config=/etc/hermes-inspection-proxy/evidence.env
+lock=/etc/hermes-inspection-proxy/.body-capture.lock
+umask 027
+exec 9>>"$lock"
+/usr/bin/flock -w 5 -x 9
+
+read_value() {
+  /usr/bin/sed -n "s/^$1=//p" "$config" | /usr/bin/tail -n 1
+}
+
+write_config() {
+  enabled=$1
+  expires=$2
+  max_bytes=$(read_value HERMES_BODY_CAPTURE_MAX_BYTES || true)
+  case "$max_bytes" in ''|*[!0-9]*) max_bytes=131072 ;; esac
+  temporary=$(/usr/bin/mktemp /etc/hermes-inspection-proxy/.evidence.env.XXXXXX)
+  trap '/usr/bin/rm -f -- "$temporary"' EXIT
+  {
+    printf 'HERMES_CAPTURE_BODIES=%s\n' "$enabled"
+    printf 'HERMES_BODY_CAPTURE_MAX_BYTES=%s\n' "$max_bytes"
+    printf 'HERMES_BODY_CAPTURE_EXPIRES_AT=%s\n' "$expires"
+  } >"$temporary"
+  /usr/bin/chown root:root "$temporary"
+  /usr/bin/chmod 0640 "$temporary"
+  /usr/bin/mv -f -- "$temporary" "$config"
+  trap - EXIT
+}
+
+emit_json() {
+  enabled=$1; expires=$2; outcome=$3
+  if [ "$expires" -gt 0 ]; then
+    expiry=$(/usr/bin/date -u -d "@$expires" '+%Y-%m-%dT%H:%M:%SZ')
+    printf '{"enabled":%s,"expires_at":"%s","outcome":"%s"}\n' "$enabled" "$expiry" "$outcome"
+  else
+    printf '{"enabled":%s,"expires_at":null,"outcome":"%s"}\n' "$enabled" "$outcome"
+  fi
+}
+
+fail() {
+  outcome=$1
+  if $json; then emit_json false 0 "$outcome"; else printf '%s\n' "$outcome" >&2; fi
+  exit "${2:-1}"
+}
+
+restart_proxy() {
+  /usr/bin/systemctl restart hermes-tls-proxy.service >/dev/null 2>&1 || fail internal_error
+}
+
+read_state() {
+  enabled=$(read_value HERMES_CAPTURE_BODIES || true)
+  expires=$(read_value HERMES_BODY_CAPTURE_EXPIRES_AT || true)
+  case "$enabled" in true|false) ;; *) enabled=false ;; esac
+  case "$expires" in ''|*[!0-9]*) expires=0 ;; esac
+}
+
+case "${1:-}" in
+  enable)
+    hours=${2:-}
+    if [ "$#" -ne 2 ]; then
+      fail invalid_ttl 2
+    fi
+    case "$hours" in [1-9]|1[0-9]|2[0-4]) ;; *) fail invalid_ttl 2 ;; esac
+    expires=$(( $(/usr/bin/date +%s) + hours * 3600 ))
+    write_config true "$expires"
+    restart_proxy
+    if $json; then
+      emit_json true "$expires" enabled
+    else
+      printf 'Body capture enabled until %s UTC\n' \
+        "$(/usr/bin/date -u -d "@$expires" '+%Y-%m-%dT%H:%M:%SZ')"
+    fi
+    ;;
+  disable)
+    [ "$#" -eq 1 ] || fail internal_error 2
+    write_config false 0
+    restart_proxy
+    if $json; then emit_json false 0 disabled; else printf 'Body capture disabled\n'; fi
+    ;;
+  expire-if-due)
+    [ "$#" -eq 1 ] || fail internal_error 2
+    read_state
+    if [ "$enabled" = true ] && { [ "$expires" -eq 0 ] || [ "$(/usr/bin/date +%s)" -ge "$expires" ]; }; then
+      write_config false 0
+      restart_proxy
+      printf 'Expired body capture disabled\n'
+    fi
+    ;;
+  status)
+    [ "$#" -eq 1 ] || fail internal_error 2
+    read_state
+    if [ "$enabled" = true ] && { [ "$expires" -eq 0 ] || [ "$(/usr/bin/date +%s)" -ge "$expires" ]; }; then
+      write_config false 0
+      restart_proxy
+      if $json; then emit_json false 0 expired; else printf 'Body capture expired and disabled\n'; fi
+    elif [ "$enabled" = true ]; then
+      if $json; then emit_json true "$expires" status; else printf 'enabled=true\nexpires_at=%s\n' "$expires"; fi
+    else
+      if $json; then emit_json false 0 status; else printf 'enabled=false\nexpires_at=0\n'; fi
+    fi
+    ;;
+  *) fail internal_error 2 ;;
+esac

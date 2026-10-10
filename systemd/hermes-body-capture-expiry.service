@@ -1,0 +1,8 @@
+[Unit]
+Description=Disable Hermes proxy body capture at its expiry
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/hermes-body-capture expire-if-due
