@@ -34,7 +34,9 @@ class Executor:
         self.action = action or UfwAction()
         self.clock = clock
         self.lock = asyncio.Lock()
-        self.bot_uid = pwd.getpwnam(config.bot_user).pw_uid
+        bot_account = pwd.getpwnam(config.bot_user)
+        self.bot_uid = bot_account.pw_uid
+        self.bot_gid = bot_account.pw_gid
         self.hermes_uid = pwd.getpwnam(config.hermes_user).pw_uid
 
     def _revalidate(self, row: Any) -> dict[str, Any]:
@@ -202,7 +204,7 @@ async def serve(config: ExecutorConfig, policy: Policy) -> None:
     await executor.reconcile()
     server = await asyncio.start_unix_server(executor.connection, str(config.bot_socket),
                                              limit=MAX_MESSAGE_BYTES + 1)
-    os.chown(config.bot_socket, 0, executor.bot_uid)
+    os.chown(config.bot_socket, 0, executor.bot_gid)
     os.chmod(config.bot_socket, 0o660)
 
     async def sweeper() -> None:

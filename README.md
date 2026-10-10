@@ -1,5 +1,7 @@
 # Deadbolt
 
+[![Deadbolt CI](https://github.com/TheUserErr0r/Deadbolt/actions/workflows/ci.yml/badge.svg?event=push)](https://github.com/TheUserErr0r/Deadbolt/actions/workflows/ci.yml)
+
 Human-approved, time-limited privileged actions for AI agents.
 
 Deadbolt v0.5 is an **undeployed local development release**. It accepts a small structured request from an unprivileged `hermes` user, relays it through a dedicated `deadbolt` Discord bot account, and lets a root executor apply only root-owned UFW profiles after a configured human approves. No generic command, destination, port, service name, or systemd unit can be supplied by Hermes. The repository deliberately contains no deployment credentials or real profiles.
@@ -28,7 +30,54 @@ For an isolated installation, create a Python virtual environment and install `.
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-The tests use temporary SQLite files and a fake UFW runner. They never alter the host firewall or contact Discord. The bot's `--dry-run` option prints approval cards without a token; it does not approve requests or change UFW rules. Running that relay still requires the dedicated Unix accounts and socket directories; use the unit tests for development on an ordinary workstation.
+The local unit tests use temporary SQLite files and a fake UFW runner. They never alter the host firewall or contact Discord. The bot's `--dry-run` option prints approval cards without a token; it does not approve requests or change UFW rules. Running that relay still requires the dedicated Unix accounts and socket directories; use the unit tests for development on an ordinary workstation.
+
+## GitHub Actions verification
+
+The badge at the top shows the latest **push** result for [Deadbolt CI](.github/workflows/ci.yml). It updates automatically as the workflow runs; click it for job logs and run history. Until `main` has its first run, GitHub displays the latest matching run from another branch.
+
+| Check | What it exercises | Runs on |
+| --- | --- | --- |
+| Unit | Policy, state, recovery, and mocked Discord approval interactions | Pull requests and pushes |
+| Unix sockets | Real `hermes` and `deadbolt` users, peer credentials, dry-run relay, denial, and audit records | Pushes |
+| UFW | Tagged rule application and rollback in a network-isolated Docker container | Pushes |
+
+Each job uses a fresh GitHub-hosted runner. No bot token, Discord server, Hermes host, or Argus service is involved.
+
+These checks are useful before lab testing, but they do not establish that the systemd templates or a live Discord interaction work on the target host. The privileged jobs run only for pushes to this repository; pull requests run the unit suite.
+
+## How to use it on a controlled test host
+
+Deadbolt has no production deployment yet. Use a disposable or otherwise controlled Linux host for the first end-to-end test. The following describes the intended operator sequence; it does not change Hermes or Argus.
+
+1. Ensure Python 3.12+, UFW, `systemd`, and the Unix user and group `hermes` exist. Create a separate non-login `deadbolt` service user and group with no sudo or privileged supplementary groups. Leave the interactive `zeus` account alone. Install a pinned Deadbolt checkout or wheel into a root-owned virtual environment at `/opt/deadbolt/venv`; install the `bot` extra there for `discord.py`. Neither `hermes` nor `deadbolt` should be able to edit that environment.
+2. Copy `examples/executor.toml`, `examples/profiles.toml`, and `examples/bot.env` into `/etc/deadbolt/` as root-owned files with mode `0600`. Replace every Discord ID and the token in those private copies. Use the same user, guild, and channel IDs in both the executor and bot configurations. Add only reviewed, narrow UFW profiles to `profiles.toml`; the example file permits no action as shipped. Keep all three files out of Git.
+3. Install the two service units from `systemd/` under `/etc/systemd/system/`, and install `systemd/deadbolt-tmpfiles.conf` as `/etc/tmpfiles.d/deadbolt.conf`. Run `systemd-tmpfiles --create /etc/tmpfiles.d/deadbolt.conf`, then `systemctl daemon-reload`. Start `deadbolt-executor.service` first and `deadbolt-bot.service` second. The unit files expect the virtual environment at the path above. Verify the executor is root, the bot is `deadbolt`, and `/run/deadbolt/bot.sock` is `root:deadbolt` mode `0660`.
+4. From a process running **as `hermes`**, submit a named profile. The installed Python package includes a small socket client helper; it adds the protocol version automatically:
+
+   ```sh
+   /opt/deadbolt/venv/bin/python - <<'PY'
+   import asyncio
+   import json
+   from deadbolt.protocol import rpc
+
+   result = asyncio.run(rpc("/run/deadbolt/ingress/hermes.sock", {
+       "op": "submit",
+       "action": "firewall_profile",
+       "profile": "https-temporary",  # Must exist in root-owned profiles.toml.
+       "reason": "Temporary access for the approved task",
+       "ttl_seconds": 900,
+   }))
+   print(json.dumps(result, indent=2))
+   PY
+   ```
+
+5. The bot posts the root-generated rule description to the configured Discord channel. Check the profile, network, port, reason, and effective TTL on the card before selecting **Approve** or **Deny**. Only the configured Discord user can decide, and the card expires after ten minutes. `/deadbolt status <request-id>` shows the current state; `/deadbolt deny <request-id>` is available if the card button cannot be used. There is no slash-command approval fallback in v0.5.
+6. On approval, inspect `ufw show added` for the unique `deadbolt:<request-id>` comment and check `/var/log/deadbolt/audit.jsonl` or `journalctl -u deadbolt-executor.service` for the grant event. When the active TTL elapses, the executor should remove only its tagged rule and the request should become `rolled_back`. On denial or pending expiry, UFW should remain unchanged. A rollback failure stays visible in state and audit records for operator attention.
+
+For a token-free relay check, run `deadbolt-bot --dry-run` as the `deadbolt` user while the executor is running, instead of starting the Discord bot service. It prints cards to stdout and cannot approve them. It still requires the same Unix socket directories and root configuration. Never run the bot as `zeus` or root.
+
+Before production use, exercise approval, denial, pending expiry, active expiry, an executor restart with a live grant, and a deliberate rollback failure on the test host. Confirm the actual firewall and Discord results rather than relying only on unit tests.
 
 ## Request protocol
 
