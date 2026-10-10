@@ -46,6 +46,8 @@ Pending approval expires after 10 minutes. Active TTL starts after successful ap
 
 Sanitized configuration lives in `examples/`; systemd templates live in `systemd/`. Production configuration belongs only in `/etc/deadbolt/`, with root-owned policy, state, and audit paths. The `deadbolt` account must be a dedicated non-login user with no sudo or privileged supplementary groups. `zeus` remains the human/operator account and is not used by the bot. The root executor is the only privileged process. The ingress directory is `deadbolt:hermes` mode `0750`; its socket is mode `0666` *inside that private directory* and still checks the peer UID. The root socket is `root:deadbolt` mode `0660` under a root-owned runtime directory.
 
+Install and run the tmpfiles definition before starting the units. It creates the private ingress directory and the UFW and iptables lock files needed by the executor's `ProtectSystem=strict` sandbox.
+
 Do not deploy these templates to Hermes until the local tests, review, concrete root-owned UFW profiles, Discord IDs, and service permissions have been checked. Deployment source should be a pinned release under `/opt/deadbolt`, owned by root and not writable by `hermes` or `deadbolt`.
 
 Teleport identity issuance, renewal, and revocation are disabled in v0.5. Service actions have no permitted profiles. Existing Teleport session recording and Argus telemetry are external to Deadbolt; this project does not change them.
