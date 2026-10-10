@@ -4,7 +4,9 @@
 
 Human-approved, time-limited privileged actions for AI agents.
 
-Deadbolt v0.6 accepts small structured requests from an unprivileged `hermes` user, relays them through a dedicated `deadbolt` Discord bot account, and lets a root executor apply only root-owned profiles after the configured operator approves. Operator-only commands provide an emergency stop, separately approved recovery, and approved exact-host body-capture exclusions. UFW profiles are supported; body capture remains disabled in the example policy until its helper and independent expiry timer are tested. Hermes cannot supply a command, arbitrary firewall rule, service name, or systemd unit. The repository contains no deployment credentials or real firewall profiles.
+Deadbolt is an experimental VM control plane for the Hermes agent system. Hermes sends structured requests over local Unix sockets; an unprivileged Discord bot presents them to a human operator; a root executor applies only predefined, root-owned actions. Deadbolt v0.6 supports UFW profiles, an operator-controlled emergency stop and recovery, and approved exact-host body-capture exclusions. Body capture remains disabled in the example policy until its helper and independent expiry timer are tested. Hermes cannot supply a command, arbitrary firewall rule, service name, or systemd unit. The repository contains no deployment credentials or real firewall profiles.
+
+> **Project provenance and caution:** The design was developed by a human for an agentic use case. This entire README was AI-generated from that design and reviewed by a human. That review does not guarantee clear writing, faithful implementation of the design, or suitability for a particular VM. Treat the documentation as a guide to verify against the code and your own test environment before relying on Deadbolt for access control.
 
 ## Architecture
 
