@@ -34,6 +34,18 @@ jobs:
           python-version: '3.12'
       - run: sudo env PYTHONPATH="$GITHUB_WORKSPACE/src" "$(command -v python)" tests/ci/socket_integration.py
 
+  systemd-restarts:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo "$(command -v python)" tests/ci/systemd_restart.py
+
   ufw:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04

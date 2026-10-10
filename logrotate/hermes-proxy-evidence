@@ -1,0 +1,11 @@
+/var/log/hermes-proxy/evidence.jsonl {
+    hourly
+    rotate 24
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su tlsproxy tlsproxy
+}

@@ -2,6 +2,7 @@
 Description=Deadbolt unprivileged Discord relay
 Requires=deadbolt-executor.service
 After=deadbolt-executor.service
+PartOf=deadbolt-executor.service
 
 [Service]
 Type=simple

@@ -4,7 +4,7 @@
 
 Human-approved, time-limited privileged actions for AI agents.
 
-Deadbolt v0.5 is an **undeployed local development release**. It accepts a small structured request from an unprivileged `hermes` user, relays it through a dedicated `deadbolt` Discord bot account, and lets a root executor apply only root-owned profiles after a configured human approves. UFW profiles are supported; the body-capture adapter remains disabled in the example policy until its external helper is installed and tested. No generic command, destination, port, service name, or systemd unit can be supplied by Hermes. The repository deliberately contains no deployment credentials or real firewall profiles.
+Deadbolt v0.5 accepts a small structured request from an unprivileged `hermes` user, relays it through a dedicated `deadbolt` Discord bot account, and lets a root executor apply only root-owned profiles after a configured human approves. UFW profiles are supported; body capture remains disabled in the example policy until its helper and independent expiry timer are installed and tested. No generic command, destination, port, service name, or systemd unit can be supplied by Hermes. The repository deliberately contains no deployment credentials or real firewall profiles.
 
 ## Architecture
 
@@ -42,19 +42,20 @@ The badge at the top shows the latest **push** result for [Deadbolt CI](.github/
 | --- | --- | --- |
 | Unit | Policy, state, recovery, mocked Discord approval interactions, and mocked body-capture helper | Pull requests and pushes |
 | Unix sockets | Real `hermes` and `deadbolt` users, peer credentials, dry-run relay, denial, and audit records | Pushes |
+| systemd restarts | Shipped service units, runtime-directory ownership, executor and bot restarts, and Hermes ingress recovery | Pushes and same-repository pull requests |
 | UFW | Tagged rule application and rollback in a network-isolated Docker container | Pushes |
 
 Each job uses a fresh GitHub-hosted runner. No bot token, Discord server, Hermes host, or Argus service is involved.
 
-These checks are useful before lab testing, but they do not establish that the systemd templates or a live Discord interaction work on the target host. The privileged jobs run only for pushes to this repository; pull requests run the unit suite.
+These checks are useful before lab testing, but they do not establish that a live Discord interaction works on the target host. The systemd restart job also runs for pull requests whose head branch belongs to this repository; fork pull requests run the unit suite without executing their code as root.
 
 ## How to use it on a controlled test host
 
-Deadbolt has no production deployment yet. Use a disposable or otherwise controlled Linux host for the first end-to-end test. The following describes the intended operator sequence; it does not change Hermes or Argus.
+Use a disposable or otherwise controlled Linux host for the first end-to-end test. The following describes the intended operator sequence; it does not change Hermes or Argus.
 
 1. Ensure Python 3.12+, UFW, `systemd`, and the Unix user and group `hermes` exist. Create a separate non-login `deadbolt` service user and group with no sudo or privileged supplementary groups. Leave the interactive `zeus` account alone. Install a pinned Deadbolt checkout or wheel into a root-owned virtual environment at `/opt/deadbolt/venv`; install the `bot` extra there for `discord.py`. Neither `hermes` nor `deadbolt` should be able to edit that environment.
 2. Copy `examples/executor.toml`, `examples/profiles.toml`, and `examples/bot.env` into `/etc/deadbolt/` as root-owned files with mode `0600`. Replace every Discord ID and the token in those private copies. Use the same user, guild, and channel IDs in both the executor and bot configurations. Add only reviewed, narrow UFW profiles to `profiles.toml`; the example file permits no action as shipped. Keep all three files out of Git.
-3. Install the two service units from `systemd/` under `/etc/systemd/system/`, and install `systemd/deadbolt-tmpfiles.conf` as `/etc/tmpfiles.d/deadbolt.conf`. Run `systemd-tmpfiles --create /etc/tmpfiles.d/deadbolt.conf`, then `systemctl daemon-reload`. Start `deadbolt-executor.service` first and `deadbolt-bot.service` second. The unit files expect the virtual environment at the path above. Verify the executor is root, the bot is `deadbolt`, and `/run/deadbolt/bot.sock` is `root:deadbolt` mode `0660`.
+3. Install the two service units from `systemd/` under `/etc/systemd/system/`, and install `systemd/deadbolt-tmpfiles.conf` as `/etc/tmpfiles.d/deadbolt.conf`. Run `systemd-tmpfiles --create /etc/tmpfiles.d/deadbolt.conf`, then `systemctl daemon-reload`. Start `deadbolt-executor.service` first and `deadbolt-bot.service` second. The unit files expect the virtual environment at the path above. Verify the executor is root, the bot is `deadbolt`, and `/run/deadbolt/bot.sock` is `root:deadbolt` mode `0660`. The executor preserves `/run/deadbolt` on restart so systemd does not remove the bot-owned ingress directory; an explicit executor restart also restarts the bot. After either restart, verify both sockets and the ingress directory ownership before accepting requests.
 4. From a process running **as `hermes`**, submit a named profile. The installed Python package includes a small socket client helper; it adds the protocol version automatically:
 
    ```sh
@@ -93,13 +94,13 @@ The bot forwards the request to root, including the UID obtained from peer crede
 
 ### Body capture adapter
 
-After the root-owned helper and its **independent** expiry timer have been installed and verified on the target host, set `[proxy_body_capture] enabled = true` in the root-owned policy. Hermes can then request an approved enable:
+Install the versioned helper, its **independent** expiry timer, and the rotation templates as described below. Verify the helper against the target proxy before setting `[proxy_body_capture] enabled = true` in root-owned policy. Hermes can then request an approved enable:
 
 ```json
 {"version":1,"op":"submit","action":"proxy_body_capture","profile":"proxy_body_capture","reason":"diagnostics","hours":2}
 ```
 
-`hours` must be an integer from 1 through 24. Every enable requires a new Discord approval; the card shows the requested duration and warns that decrypted HTTP request and response bodies are retained on Argus for 24 hours. Deadbolt invokes only `/usr/local/sbin/hermes-body-capture --json enable HOURS`. The helper returns a single compact JSON line with exactly `enabled`, `expires_at` (whole-second RFC3339 UTC or null), and `outcome` (`enabled`, `disabled`, `status`, `expired`, `invalid_ttl`, or `internal_error`). Deadbolt records the helper's expiry, which replaces any prior expiry; it never extends from the old deadline. The helper and its root-owned systemd timer enforce expiry independently of Deadbolt. This repository does not install the helper, timer, log rotation, or Loki retention.
+`hours` must be an integer from 1 through 24. Every enable requires a new Discord approval; the card shows the requested duration and warns that decrypted HTTP request and response bodies are retained on Argus for 24 hours. Deadbolt invokes only `/usr/local/sbin/hermes-body-capture --json enable HOURS`. The helper returns a single compact JSON line with exactly `enabled`, `expires_at` (whole-second RFC3339 UTC or null), and `outcome` (`enabled`, `disabled`, `status`, `expired`, `invalid_ttl`, or `internal_error`). Deadbolt records the helper's expiry, which replaces any prior expiry; it never extends from the old deadline. The helper and its root-owned systemd timer enforce expiry independently of Deadbolt. The helper serializes concurrent calls, and an enabled state with an invalid expiry is disabled by `status` or the timer. Loki retention remains an Argus-side configuration.
 
 Only the configured Discord operator may use `/deadbolt capture_status` and `/deadbolt capture_disable`. These commands call the fixed helper `--json status` and `--json disable` forms without a second approval. Hermes cannot reach them through the ingress socket. The bot and audit log receive only the validated structured result; helper stderr and raw output are discarded. Deadbolt deliberately does not persist or display Hermes's freeform reason for body-capture and exclusion requests, preventing accidental evidence or secret URLs from appearing in cards or audit records.
 
@@ -119,11 +120,28 @@ Pending approval expires after 10 minutes. UFW active TTL starts after successfu
 
 ## Deployment templates
 
-Sanitized configuration lives in `examples/`; systemd templates live in `systemd/`. Production configuration belongs only in `/etc/deadbolt/`, with root-owned policy, state, and audit paths. The `deadbolt` account must be a dedicated non-login user with no sudo or privileged supplementary groups. `zeus` remains the human/operator account and is not used by the bot. The root executor is the only privileged process. The ingress directory is `deadbolt:hermes` mode `0750`; its socket is mode `0666` *inside that private directory* and still checks the peer UID. The root socket is `root:deadbolt` mode `0660` under a root-owned runtime directory.
+Sanitized configuration lives in `examples/`; systemd templates live in `systemd/`; the capture helper lives in `scripts/`; log rotation templates live in `logrotate/`. Production configuration belongs only in `/etc/deadbolt/`, with root-owned policy, state, and audit paths. The `deadbolt` account must be a dedicated non-login user with no sudo or privileged supplementary groups. `zeus` remains the human/operator account and is not used by the bot. The root executor is the only privileged Deadbolt process. The ingress directory is `deadbolt:hermes` mode `0750`; its socket is mode `0666` *inside that private directory* and still checks the peer UID. The root socket is `root:deadbolt` mode `0660` under a root-owned runtime directory.
 
 Install and run the tmpfiles definition before starting the units. It creates the private ingress directory and the UFW and iptables lock files needed by the executor's `ProtectSystem=strict` sandbox. When testing body capture, ensure `/etc/hermes-inspection-proxy` exists. The executor unit permits atomic writes there for the fixed helper and approved exclusion file; the path is optional so UFW-only hosts can still start the unit.
 
-Do not deploy these templates to Hermes until the local tests, review, concrete root-owned UFW profiles, Discord IDs, and service permissions have been checked. Deployment source should be a pinned release under `/opt/deadbolt`, owned by root and not writable by `hermes` or `deadbolt`.
+### Versioned capture host files
+
+The repository includes the helper and the currently used expiry and rotation templates. On a controlled host, compare these files to the installed versions and install them as root:
+
+```sh
+install -o root -g root -m 0750 scripts/hermes-body-capture /usr/local/sbin/hermes-body-capture
+install -o root -g root -m 0644 systemd/hermes-body-capture-expiry.service /etc/systemd/system/
+install -o root -g root -m 0644 systemd/hermes-body-capture-expiry.timer /etc/systemd/system/
+install -o root -g root -m 0644 logrotate/hermes-proxy-evidence /etc/logrotate.d/
+install -o root -g root -m 0644 logrotate/hermes-proxy /etc/logrotate.d/
+systemctl daemon-reload
+systemctl enable --now hermes-body-capture-expiry.timer
+/usr/local/sbin/hermes-body-capture --json status
+```
+
+The helper writes `/etc/hermes-inspection-proxy/evidence.env` by atomic replacement and maintains a root-owned lock file in the same directory, then restarts the existing `hermes-tls-proxy.service`. The proxy must already consume `HERMES_CAPTURE_BODIES`, `HERMES_BODY_CAPTURE_MAX_BYTES`, and `HERMES_BODY_CAPTURE_EXPIRES_AT` from that file. The timer invokes `expire-if-due` every minute, even when Deadbolt is stopped, and starts again after reboot. Check `systemctl list-timers hermes-body-capture-expiry.timer` and the helper's JSON status before enabling the Deadbolt profile. Both rotation templates use `copytruncate` so a running proxy keeps writing to the same log file after rotation. The evidence template requests hourly rotation with 24 archives; configure the host's logrotate scheduler to invoke it hourly. `copytruncate` has a brief copy/truncate window in which log lines can be lost. The Argus Loki retention policy and the proxy service itself are not included here.
+
+Deployment source should be a pinned release under `/opt/deadbolt`, owned by root and not writable by `hermes` or `deadbolt`. Review concrete root-owned UFW profiles, Discord IDs, and service permissions before rollout.
 
 Teleport identity issuance, renewal, and revocation are disabled in v0.5. Service actions have no permitted profiles. Existing Teleport session recording and Argus telemetry are external to Deadbolt; this project does not change them.
 

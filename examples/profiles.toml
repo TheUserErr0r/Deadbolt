@@ -1,7 +1,7 @@
 # Root-owned allow-list. Empty by default: no privileged action can be granted.
 [firewall_profiles]
 
-# Body capture remains disabled until the external root-owned helper and its
+# Body capture remains disabled until the versioned root-owned helper and its
 # independent expiry timer are verified on the target host.
 [proxy_body_capture]
 enabled = false
