@@ -39,7 +39,8 @@ def wait_for_socket(path: Path, process: subprocess.Popen[str]) -> None:
         if path.is_socket():
             return
         if process.poll() is not None:
-            raise AssertionError(f"process exited before {path}: {process.returncode}")
+            details = process.stderr.read() if process.stderr else ""
+            raise AssertionError(f"process exited before {path}: {process.returncode}\n{details}")
         time.sleep(0.1)
     raise AssertionError(f"socket did not appear: {path}")
 
