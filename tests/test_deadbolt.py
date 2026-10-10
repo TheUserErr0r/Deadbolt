@@ -221,7 +221,8 @@ class ExecutorTests(unittest.TestCase):
         self.fake = FakeUfw()
         self.action = UfwAction(self.fake)
         self.now = 1000.0
-        lookup = lambda name: SimpleNamespace(pw_uid=101 if name == "deadbolt" else 102)
+        lookup = lambda name: SimpleNamespace(pw_uid=101 if name == "deadbolt" else 102,
+                                              pw_gid=201 if name == "deadbolt" else 202)
         self.patch = patch("deadbolt.executor.pwd.getpwnam", side_effect=lookup)
         self.patch.start()
         self.executor = Executor(config(self.base), policy(), self.store, self.action,
@@ -234,6 +235,10 @@ class ExecutorTests(unittest.TestCase):
 
     def call(self, payload: dict[str, object], uid: int = 101) -> dict[str, object]:
         return asyncio.run(self.executor.dispatch({"version": 1, **payload}, uid))
+
+    def test_bot_socket_group_uses_gid(self) -> None:
+        self.assertEqual(self.executor.bot_uid, 101)
+        self.assertEqual(self.executor.bot_gid, 201)
 
     def test_uid_and_request_tampering(self) -> None:
         payload = {"op": "create", "action": "firewall_profile", "profile": "test-ssh",
