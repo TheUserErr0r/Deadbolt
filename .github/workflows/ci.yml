@@ -35,7 +35,7 @@ jobs:
       - run: sudo env PYTHONPATH="$GITHUB_WORKSPACE/src" "$(command -v python)" tests/ci/socket_integration.py
 
   systemd-restarts:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

@@ -6,6 +6,6 @@
     notifempty
     compress
     delaycompress
-    create 0640 tlsproxy tlsproxy
+    copytruncate
     su tlsproxy tlsproxy
 }

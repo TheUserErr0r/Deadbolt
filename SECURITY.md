@@ -19,6 +19,8 @@ Body capture is disabled in the example policy. If enabled, an approved request 
 
 The exclusion file is a root-owned `root:tlsproxy` mode `0640` integration point. Deadbolt can atomically replace it only after a separate approval and only with DNS suffixes present in root-owned policy. The external proxy must match SNI first, then HTTP Host, suppress only body evidence, continue routing traffic through the proxy, retain metadata, and preserve firewall controls. Deadbolt does not itself enforce proxy matching or retention. No arbitrary regex or bypass action is exposed. An administrator must verify the external proxy's behavior before enabling capture.
 
+The shipped proxy log rotation templates use `copytruncate` to keep a long-running proxy on the current log inode. Logrotate can lose lines written during its copy/truncate window; the templates do not guarantee gap-free local evidence. Argus-side retention remains separately managed.
+
 Rollback intent is committed before applying a rule. On restart, the executor reconciles interrupted executions and overdue grants before opening its socket. Periodic sweeps retry failed rollbacks. If the executor remains stopped, an active UFW rule can outlive its intended expiry until the executor restarts; a persistent systemd timer is a future defense in depth. A rule that cannot be positively identified as Deadbolt-owned is never deleted automatically.
 
 Expiry uses the host wall clock so it can survive restarts. A root-level clock change can alter expiry behavior; accurate host time is part of the trusted operating environment.

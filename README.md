@@ -42,12 +42,12 @@ The badge at the top shows the latest **push** result for [Deadbolt CI](.github/
 | --- | --- | --- |
 | Unit | Policy, state, recovery, mocked Discord approval interactions, and mocked body-capture helper | Pull requests and pushes |
 | Unix sockets | Real `hermes` and `deadbolt` users, peer credentials, dry-run relay, denial, and audit records | Pushes |
-| systemd restarts | Shipped service units, runtime-directory ownership, executor and bot restarts, and Hermes ingress recovery | Pushes |
+| systemd restarts | Shipped service units, runtime-directory ownership, executor and bot restarts, and Hermes ingress recovery | Pushes and same-repository pull requests |
 | UFW | Tagged rule application and rollback in a network-isolated Docker container | Pushes |
 
 Each job uses a fresh GitHub-hosted runner. No bot token, Discord server, Hermes host, or Argus service is involved.
 
-These checks are useful before lab testing, but they do not establish that a live Discord interaction works on the target host. The privileged jobs run only for pushes to this repository; pull requests run the unit suite.
+These checks are useful before lab testing, but they do not establish that a live Discord interaction works on the target host. The systemd restart job also runs for pull requests whose head branch belongs to this repository; fork pull requests run the unit suite without executing their code as root.
 
 ## How to use it on a controlled test host
 
@@ -139,7 +139,7 @@ systemctl enable --now hermes-body-capture-expiry.timer
 /usr/local/sbin/hermes-body-capture --json status
 ```
 
-The helper writes only `/etc/hermes-inspection-proxy/evidence.env` and its root-owned lock file in the same directory, then restarts the existing `hermes-tls-proxy.service`. The proxy must already consume `HERMES_CAPTURE_BODIES`, `HERMES_BODY_CAPTURE_MAX_BYTES`, and `HERMES_BODY_CAPTURE_EXPIRES_AT` from that file. The timer invokes `expire-if-due` every minute, even when Deadbolt is stopped, and starts again after reboot. Check `systemctl list-timers hermes-body-capture-expiry.timer` and the helper's JSON status before enabling the Deadbolt profile. The evidence rotation template requests hourly rotation with 24 archives; configure the host's logrotate scheduler to invoke it hourly. Rotation of the proxy access log is separate. The Argus Loki retention policy and the proxy service itself are not included here.
+The helper writes `/etc/hermes-inspection-proxy/evidence.env` by atomic replacement and maintains a root-owned lock file in the same directory, then restarts the existing `hermes-tls-proxy.service`. The proxy must already consume `HERMES_CAPTURE_BODIES`, `HERMES_BODY_CAPTURE_MAX_BYTES`, and `HERMES_BODY_CAPTURE_EXPIRES_AT` from that file. The timer invokes `expire-if-due` every minute, even when Deadbolt is stopped, and starts again after reboot. Check `systemctl list-timers hermes-body-capture-expiry.timer` and the helper's JSON status before enabling the Deadbolt profile. Both rotation templates use `copytruncate` so a running proxy keeps writing to the same log file after rotation. The evidence template requests hourly rotation with 24 archives; configure the host's logrotate scheduler to invoke it hourly. `copytruncate` has a brief copy/truncate window in which log lines can be lost. The Argus Loki retention policy and the proxy service itself are not included here.
 
 Deployment source should be a pinned release under `/opt/deadbolt`, owned by root and not writable by `hermes` or `deadbolt`. Review concrete root-owned UFW profiles, Discord IDs, and service permissions before rollout.
 
