@@ -201,22 +201,21 @@ class ExclusionTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_exact_allowlist_and_atomic_replacement(self) -> None:
-        request = resolve_action("body_capture_exclusions", "body_capture_exclusions", "reduce noise",
-                                 None, policy(), config(self.base), requested_suffixes=["discordcdn.com", "discord.com"])
+        request = self.action.create_change("add", "discordcdn.com",
+                                            policy().body_exclusion_allowed_hosts)
         intent = self.action.prepare(request)
         self.action.apply(request, intent)
         self.action.apply(request, intent)
         self.assertEqual(self.path.read_text(), ExclusionsAction.header + "discord.com\ndiscordcdn.com\n")
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o640)
-        for bad in (["example.com"], ["*.discord.com"], ["discord.com:443"],
-                    ["https://discord.com"], ["192.0.2.1"], ["DISCORD.COM"]):
-            with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
-                resolve_action("body_capture_exclusions", "body_capture_exclusions", "test",
-                               None, policy(), config(self.base), requested_suffixes=bad)
+        for bad in ("example.com", "*.discord.com", "discord.com:443",
+                    "https://discord.com", "192.0.2.1", "DISCORD.COM"):
+            with self.subTest(bad=bad), self.assertRaises((ConfigurationError, ActionError)):
+                self.action.create_change("add", bad, policy().body_exclusion_allowed_hosts)
 
     def test_external_edit_refuses_approved_replacement(self) -> None:
-        request = resolve_action("body_capture_exclusions", "body_capture_exclusions", "reduce noise",
-                                 None, policy(), config(self.base), requested_suffixes=["discord.com"])
+        request = self.action.create_change("remove", "discord.com",
+                                            policy().body_exclusion_allowed_hosts)
         intent = self.action.prepare(request)
         self.path.write_text("# changed\ndiscord.com\n")
         with self.assertRaisesRegex(ActionError, "changed before apply"):
@@ -230,12 +229,17 @@ class ExclusionTests(unittest.TestCase):
             with patch("deadbolt.executor.pwd.getpwnam", side_effect=lookup):
                 executor = Executor(config(self.base), policy(), store, clock=lambda: 1000.0,
                                     policy_loader=policy, exclusions_action=self.action)
-            request = {"op": "create", "action": "body_capture_exclusions",
-                "profile": "body_capture_exclusions", "reason": "https://secret.example/token=private",
-                "suffixes": ["discord.com", "discordcdn.com"], "requested_by_uid": 102}
+            request = {"op": "exclusion_create", "operation": "add", "hostname": "discordcdn.com",
+                "user_id": "1", "guild_id": "2", "channel_id": "3", "interaction_id": "54"}
             created = asyncio.run(executor.dispatch(request, 101))["request"]
-            self.assertNotIn("secret", created["description"])
             self.assertEqual(self.path.read_text(), "# existing\ndiscord.com\n")
+            with self.assertRaises(ProtocolError):
+                asyncio.run(executor.dispatch(request, 102))
+            with self.assertRaises(ProtocolError):
+                asyncio.run(executor.dispatch({**request, "user_id": "9"}, 101))
+            with self.assertRaises(ConfigurationError):
+                asyncio.run(executor.dispatch({"op": "create", "action": "body_capture_exclusions",
+                    "profile": "body_capture_exclusions", "reason": "test", "requested_by_uid": 102}, 101))
             row = store.get(created["id"])
             asyncio.run(executor.dispatch({"op": "posted", "request_id": row["id"],
                                             "message_id": "44"}, 101))
@@ -246,9 +250,45 @@ class ExclusionTests(unittest.TestCase):
             completed = asyncio.run(executor.dispatch(decision, 101))["request"]
             self.assertEqual(completed["status"], "completed")
             self.assertIn("discordcdn.com", self.path.read_text())
-            self.assertNotIn("secret", (self.base / "audit.jsonl").read_text())
+            events = [json.loads(line) for line in (self.base / "audit.jsonl").read_text().splitlines()]
+            self.assertTrue(any(event["event"] == "request_created" and
+                                event["requested_by_discord_id"] == "1" for event in events))
+            self.assertTrue(any(event["event"] == "configuration_applied" and
+                                event["resulting_hosts"] == ["discord.com", "discordcdn.com"]
+                                for event in events))
+            self.assertTrue(any(event["event"] == "approval_granted" and
+                                event["resulting_hosts"] == ["discord.com", "discordcdn.com"]
+                                for event in events))
             with self.assertRaises(StateError):
                 asyncio.run(executor.dispatch(decision, 101))
+        finally:
+            store.close()
+
+    def test_changed_file_before_approval_is_failed_and_audited(self) -> None:
+        store = Store(self.base / "state.db", self.base / "audit.jsonl")
+        lookup = lambda name: SimpleNamespace(pw_uid=101 if name == "deadbolt" else 102,
+                                              pw_gid=201 if name == "deadbolt" else 202)
+        try:
+            with patch("deadbolt.executor.pwd.getpwnam", side_effect=lookup):
+                executor = Executor(config(self.base), policy(), store, clock=lambda: 1000.0,
+                                    policy_loader=policy, exclusions_action=self.action)
+            created = asyncio.run(executor.dispatch({"op": "exclusion_create", "operation": "add",
+                "hostname": "discordcdn.com", "user_id": "1", "guild_id": "2",
+                "channel_id": "3", "interaction_id": "54"}, 101))["request"]
+            row = store.get(created["id"])
+            asyncio.run(executor.dispatch({"op": "posted", "request_id": row["id"],
+                                           "message_id": "44"}, 101))
+            self.path.write_text("# changed\ndiscord.com\n")
+            failed = asyncio.run(executor.dispatch({"op": "decide", "request_id": row["id"],
+                "decision": "approve", "nonce": row["nonce"], "canonical_hash": row["canonical_hash"],
+                "user_id": "1", "guild_id": "2", "channel_id": "3", "message_id": "44",
+                "interaction_id": "55"}, 101))["request"]
+            self.assertEqual(failed["status"], "failed")
+            self.assertIn("# changed", self.path.read_text())
+            events = [json.loads(line) for line in (self.base / "audit.jsonl").read_text().splitlines()]
+            self.assertTrue(any(event["event"] == "execution_failed" and
+                                event["requested_hosts"] == ["discord.com", "discordcdn.com"]
+                                for event in events))
         finally:
             store.close()
 
@@ -260,8 +300,8 @@ class ExclusionTests(unittest.TestCase):
             with patch("deadbolt.executor.pwd.getpwnam", side_effect=lookup):
                 executor = Executor(config(self.base), policy(), store, clock=lambda: 1000.0,
                                     policy_loader=policy, exclusions_action=self.action)
-            canonical = resolve_action("body_capture_exclusions", "body_capture_exclusions", "test",
-                                       None, policy(), config(self.base), requested_suffixes=["discord.com"])
+            canonical = self.action.create_change("remove", "discord.com",
+                                                  policy().body_exclusion_allowed_hosts)
             row = store.create(canonical, "exclusion card", 102, 1000)
             store.mark_posted(row["id"], "44", 1000)
             store.decide(row["id"], "approve", row["nonce"], row["canonical_hash"],
@@ -281,7 +321,8 @@ class IngressTests(unittest.TestCase):
         config = BotConfig(Path("/tmp/ingress"), Path("/tmp/root"), "hermes", "1", "2", "3", None, True)
         with patch("deadbolt.bot.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=102)):
             relay = Relay(config)
-        for operation in ("capture_status", "capture_disable"):
+        for operation in ("capture_status", "capture_disable", "exclusion_create",
+                          "emergency_stop", "emergency_status", "emergency_recover_create"):
             with self.assertRaises(ProtocolError):
                 asyncio.run(relay.submit({"op": operation, "action": "proxy_body_capture",
                                           "profile": "proxy_body_capture", "reason": "test"}, 102))

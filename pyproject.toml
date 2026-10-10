@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deadbolt"
-version = "0.5.0"
+version = "0.6.0"
 description = "Human-approved, time-limited privileged actions for AI agents."
 requires-python = ">=3.12"
 license = {file = "LICENSE"}
@@ -16,6 +16,7 @@ bot = ["discord.py>=2.4,<3"]
 [project.scripts]
 deadbolt-executor = "deadbolt.executor:main"
 deadbolt-bot = "deadbolt.bot:main"
+deadbolt-emergency-restore = "deadbolt.emergency_restore:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

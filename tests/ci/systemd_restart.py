@@ -107,12 +107,23 @@ DEADBOLT_EXECUTOR_SOCKET=/run/deadbolt/bot.sock
         path.chmod(0o600)
     for name in ("deadbolt-executor.service", "deadbolt-bot.service"):
         shutil.copy2(ROOT / "systemd" / name, Path("/run/systemd/system") / name)
+    proxy_unit = Path("/run/systemd/system/hermes-tls-proxy.service")
+    proxy_unit.write_text("[Unit]\nDescription=Disposable proxy boot-order test\n"
+                          "[Service]\nType=simple\nExecStart=/usr/bin/sleep infinity\n")
+    proxy_dropin = Path("/run/systemd/system/hermes-tls-proxy.service.d")
+    proxy_dropin.mkdir()
+    shutil.copy2(ROOT / "systemd/hermes-tls-proxy-deadbolt.conf", proxy_dropin / "deadbolt.conf")
     for name, module, extra in (("deadbolt-executor", "deadbolt.executor", "--config /etc/deadbolt/executor.toml"),
                                 ("deadbolt-bot", "deadbolt.bot", "--dry-run")):
         override_dir = Path("/run/systemd/system") / f"{name}.service.d"
         override_dir.mkdir()
         (override_dir / "ci.conf").write_text(
-            "[Service]\nExecStart=\n"
+            "[Service]\n" +
+            ("ExecStartPre=\n"
+             f"ExecStartPre=/usr/bin/env PYTHONPATH={SOURCE} {sys.executable} "
+             "-m deadbolt.emergency_restore --config /etc/deadbolt/executor.toml\n"
+             if name == "deadbolt-executor" else "") +
+            "ExecStart=\n"
             f"ExecStart=/usr/bin/env PYTHONPATH={SOURCE} {sys.executable} -m {module} {extra}\n")
     run("systemd-tmpfiles", "--create", str(ROOT / "systemd/deadbolt-tmpfiles.conf"))
     run("systemctl", "daemon-reload")
@@ -139,8 +150,20 @@ DEADBOLT_EXECUTOR_SOCKET=/run/deadbolt/bot.sock
         assert assert_runtime() == inode, "bot restart replaced ingress directory"
         submit()
         print("shipped systemd units preserve ingress and relay requests after both restarts")
+
+        run("systemctl", "stop", "deadbolt-bot.service", "deadbolt-executor.service")
+        failure_override = Path("/run/systemd/system/deadbolt-executor.service.d/restore-fails.conf")
+        failure_override.write_text("[Service]\nExecStartPre=\nExecStartPre=/usr/bin/false\nRestart=no\n")
+        run("systemctl", "daemon-reload")
+        blocked = subprocess.run(["systemctl", "start", "hermes-tls-proxy.service"],
+                                 capture_output=True, text=True, timeout=30)
+        assert blocked.returncode != 0, "proxy started despite failed emergency restore"
+        assert subprocess.run(["systemctl", "is-active", "--quiet", "hermes-tls-proxy.service"],
+                              check=False).returncode != 0
+        print("proxy stays stopped when Deadbolt emergency restore fails")
     finally:
-        subprocess.run(["systemctl", "stop", "deadbolt-bot.service", "deadbolt-executor.service"],
+        subprocess.run(["systemctl", "stop", "hermes-tls-proxy.service",
+                        "deadbolt-bot.service", "deadbolt-executor.service"],
                        check=False, timeout=30)
 
 
