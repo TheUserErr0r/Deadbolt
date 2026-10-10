@@ -1,5 +1,7 @@
 # Deadbolt
 
+[![Deadbolt CI](https://github.com/TheUserErr0r/Deadbolt/actions/workflows/ci.yml/badge.svg?event=push)](https://github.com/TheUserErr0r/Deadbolt/actions/workflows/ci.yml)
+
 Human-approved, time-limited privileged actions for AI agents.
 
 Deadbolt v0.5 is an **undeployed local development release**. It accepts a small structured request from an unprivileged `hermes` user, relays it through a dedicated `deadbolt` Discord bot account, and lets a root executor apply only root-owned UFW profiles after a configured human approves. No generic command, destination, port, service name, or systemd unit can be supplied by Hermes. The repository deliberately contains no deployment credentials or real profiles.
@@ -32,7 +34,15 @@ The local unit tests use temporary SQLite files and a fake UFW runner. They neve
 
 ## GitHub Actions verification
 
-[The CI workflow](.github/workflows/ci.yml) runs the unit suite on pull requests and branch pushes. On pushes, a fresh GitHub-hosted Ubuntu runner also creates disposable `hermes` and `deadbolt` users, starts both real Unix sockets, submits and denies a request through the dry-run relay, checks peer permissions, and checks the audit log. A separate job applies and removes a tagged UFW rule inside a Docker container with no network connection. The approval callback is exercised with mock Discord interactions; no bot token, Discord server, Hermes host, or Argus service is involved.
+The badge at the top shows the latest **push** result for [Deadbolt CI](.github/workflows/ci.yml). It updates automatically as the workflow runs; click it for job logs and run history. Until `main` has its first run, GitHub displays the latest matching run from another branch.
+
+| Check | What it exercises | Runs on |
+| --- | --- | --- |
+| Unit | Policy, state, recovery, and mocked Discord approval interactions | Pull requests and pushes |
+| Unix sockets | Real `hermes` and `deadbolt` users, peer credentials, dry-run relay, denial, and audit records | Pushes |
+| UFW | Tagged rule application and rollback in a network-isolated Docker container | Pushes |
+
+Each job uses a fresh GitHub-hosted runner. No bot token, Discord server, Hermes host, or Argus service is involved.
 
 These checks are useful before lab testing, but they do not establish that the systemd templates or a live Discord interaction work on the target host. The privileged jobs run only for pushes to this repository; pull requests run the unit suite.
 
