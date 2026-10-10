@@ -28,7 +28,13 @@ For an isolated installation, create a Python virtual environment and install `.
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-The tests use temporary SQLite files and a fake UFW runner. They never alter the host firewall or contact Discord. The bot's `--dry-run` option prints approval cards without a token; it does not approve requests or change UFW rules. Running that relay still requires the dedicated Unix accounts and socket directories; use the unit tests for development on an ordinary workstation.
+The local unit tests use temporary SQLite files and a fake UFW runner. They never alter the host firewall or contact Discord. The bot's `--dry-run` option prints approval cards without a token; it does not approve requests or change UFW rules. Running that relay still requires the dedicated Unix accounts and socket directories; use the unit tests for development on an ordinary workstation.
+
+## GitHub Actions verification
+
+[The CI workflow](.github/workflows/ci.yml) runs the unit suite on pull requests and branch pushes. On pushes, a fresh GitHub-hosted Ubuntu runner also creates disposable `hermes` and `deadbolt` users, starts both real Unix sockets, submits and denies a request through the dry-run relay, checks peer permissions, and checks the audit log. A separate job applies and removes a tagged UFW rule inside a Docker container with no network connection. The approval callback is exercised with mock Discord interactions; no bot token, Discord server, Hermes host, or Argus service is involved.
+
+These checks are useful before lab testing, but they do not establish that the systemd templates or a live Discord interaction work on the target host. The privileged jobs run only for pushes to this repository; pull requests run the unit suite.
 
 ## How to use it on a controlled test host
 

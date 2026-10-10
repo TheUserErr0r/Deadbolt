@@ -171,6 +171,32 @@ async def poll_pending(relay: Relay, post: Callable[[dict[str, Any]], Awaitable[
         await asyncio.sleep(5)
 
 
+async def handle_approval_button(relay: Relay, card_row: dict[str, Any], interaction: Any,
+                                 decision: str, allowed: Callable[[Any], bool],
+                                 render_card: Callable[[dict[str, Any]], Any]) -> None:
+    """Handle a Discord button using the posted record, without needing a live Gateway in tests."""
+    if not allowed(interaction) or not interaction.message:
+        await interaction.response.send_message("Not authorized for this approval.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        updated = await relay.decide_posted(
+            card_row, decision, str(interaction.message.id), str(interaction.id),
+            str(interaction.user.id), str(interaction.guild_id), str(interaction.channel_id))
+    except Exception as exc:
+        await interaction.followup.send(f"Decision rejected: {exc}", ephemeral=True)
+        return
+    try:
+        await interaction.message.edit(embed=render_card(updated), view=None)
+    except Exception:
+        LOG.exception("approval card update failed after executor decision")
+        await interaction.followup.send(
+            f"Request {updated['id']}: {updated['status']}. Card update failed; use /deadbolt status.",
+            ephemeral=True)
+        return
+    await interaction.followup.send(f"Request {updated['id']}: {updated['status']}", ephemeral=True)
+
+
 async def run_dry(config: BotConfig) -> None:
     relay = Relay(config)
     server = await relay.serve_ingress()
@@ -215,27 +241,7 @@ async def run_discord(config: BotConfig) -> None:
                 custom_id=f"deadbolt:{decision}:{row['id']}:{row['nonce']}")
 
             async def callback(interaction: discord.Interaction, choice: str = decision) -> None:
-                if not allowed(interaction) or not interaction.message:
-                    await interaction.response.send_message("Not authorized for this approval.", ephemeral=True)
-                    return
-                await interaction.response.defer(ephemeral=True, thinking=True)
-                try:
-                    updated = await relay.decide_posted(
-                        row, choice, str(interaction.message.id), str(interaction.id),
-                        str(interaction.user.id), str(interaction.guild_id),
-                        str(interaction.channel_id))
-                except Exception as exc:
-                    await interaction.followup.send(f"Decision rejected: {exc}", ephemeral=True)
-                    return
-                try:
-                    await interaction.message.edit(embed=card(updated), view=None)
-                except Exception:
-                    LOG.exception("approval card update failed after executor decision")
-                    await interaction.followup.send(
-                        f"Request {updated['id']}: {updated['status']}. Card update failed; use /deadbolt status.",
-                        ephemeral=True)
-                    return
-                await interaction.followup.send(f"Request {updated['id']}: {updated['status']}", ephemeral=True)
+                await handle_approval_button(relay, row, interaction, choice, allowed, card)
 
             button.callback = callback
             view.add_item(button)

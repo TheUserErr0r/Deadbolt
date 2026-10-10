@@ -13,10 +13,10 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from deadbolt.actions import ActionError, UfwAction
-from deadbolt.bot import BotConfig, Relay
+from deadbolt.bot import BotConfig, Relay, handle_approval_button
 from deadbolt.config import ConfigurationError, ExecutorConfig, FirewallProfile, Policy, resolve_action
 from deadbolt.executor import Executor
 from deadbolt.protocol import ProtocolError, decode_message, peer_uid, require_fields
@@ -92,6 +92,32 @@ class ProtocolTests(unittest.TestCase):
     def test_linux_peer_credentials(self) -> None:
         fake = SimpleNamespace(getsockopt=lambda level, option, size: struct.pack("3i", 123, 456, 789))
         self.assertEqual(peer_uid(fake), 456)
+
+
+class DiscordButtonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_approved_interaction_uses_posted_card_and_updates_message(self) -> None:
+        relay = SimpleNamespace(decide_posted=AsyncMock(return_value={"id": "request-1", "status": "active"}))
+        interaction = SimpleNamespace(
+            id=55, user=SimpleNamespace(id=1), guild_id=2, channel_id=3,
+            message=SimpleNamespace(id=44, edit=AsyncMock()),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()))
+        row = {"id": "request-1", "nonce": "nonce"}
+        await handle_approval_button(relay, row, interaction, "approve", lambda _: True,
+                                     lambda updated: updated["status"])
+        relay.decide_posted.assert_awaited_once_with(row, "approve", "44", "55", "1", "2", "3")
+        interaction.message.edit.assert_awaited_once_with(embed="active", view=None)
+        interaction.followup.send.assert_awaited_once_with("Request request-1: active", ephemeral=True)
+
+    async def test_unauthorized_interaction_never_reaches_executor(self) -> None:
+        relay = SimpleNamespace(decide_posted=AsyncMock())
+        interaction = SimpleNamespace(message=SimpleNamespace(id=44),
+                                      response=SimpleNamespace(send_message=AsyncMock()))
+        await handle_approval_button(relay, {"id": "request-1"}, interaction, "approve",
+                                     lambda _: False, lambda _: None)
+        relay.decide_posted.assert_not_awaited()
+        interaction.response.send_message.assert_awaited_once_with(
+            "Not authorized for this approval.", ephemeral=True)
 
 
 class PolicyTests(unittest.TestCase):
