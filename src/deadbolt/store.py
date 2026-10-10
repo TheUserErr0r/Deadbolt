@@ -46,8 +46,12 @@ class Store:
                 flushed INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (request_id) REFERENCES requests(id)
             );
+            CREATE TABLE IF NOT EXISTS operator_audit_outbox (
+                id TEXT PRIMARY KEY, payload TEXT NOT NULL, flushed INTEGER NOT NULL DEFAULT 0
+            );
             CREATE INDEX IF NOT EXISTS requests_status ON requests(status);
             CREATE INDEX IF NOT EXISTS audit_unflushed ON audit_outbox(flushed);
+            CREATE INDEX IF NOT EXISTS operator_audit_unflushed ON operator_audit_outbox(flushed);
         """)
 
     def close(self) -> None:
@@ -58,6 +62,30 @@ class Store:
                   "request_id": request_id, "event": event, **fields}
         self.db.execute("INSERT INTO audit_outbox(id,request_id,payload) VALUES(?,?,?)",
                         (record["event_id"], request_id, canonical_json(record)))
+
+    def operator_event(self, event: str, now: float, operator_id: str,
+                       interaction_id: str, result: dict[str, Any] | None = None,
+                       error: str | None = None, request_id: str | None = None,
+                       helper_outcome: str | None = None) -> None:
+        record = {"event_id": str(uuid.uuid4()),
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                  "request_id": request_id, "event": event, "approved_by_discord_id": operator_id,
+                  "interaction_id": interaction_id}
+        if result is not None:
+            record.update(enabled=result["enabled"], expires_at=result["expires_at"],
+                          helper_outcome=result["outcome"])
+        if error is not None:
+            record["error"] = error[:200]
+        if helper_outcome is not None:
+            record["helper_outcome"] = helper_outcome
+        with self.db:
+            self.db.execute("INSERT INTO operator_audit_outbox(id,payload) VALUES(?,?)",
+                            (record["event_id"], canonical_json(record)))
+
+    def current_capture_request_id(self) -> str | None:
+        row = self.db.execute("""SELECT id FROM requests WHERE action='proxy_body_capture'
+                  AND status='active' ORDER BY approved_at DESC LIMIT 1""").fetchone()
+        return row["id"] if row else None
 
     def get(self, request_id: str) -> sqlite3.Row:
         try:
@@ -150,24 +178,43 @@ class Store:
             self._event(request_id, "execution_started", now, action=row["action"], profile=row["profile"])
         return self.get(request_id)
 
-    def mark_active(self, request_id: str, now: float) -> sqlite3.Row:
+    def mark_active(self, request_id: str, now: float, *, active_until: float | None = None,
+                    helper_outcome: str | None = None) -> sqlite3.Row:
         with self.db:
             row = self.get(request_id)
             if row["status"] != "executing":
                 raise StateError("request is not executing")
             ttl = json.loads(row["canonical_json"])["ttl_seconds"]
+            expiry = active_until if active_until is not None else now + ttl
             self.db.execute("UPDATE requests SET status='active',active_until=? WHERE id=?",
-                            (now + ttl, request_id))
-            self._event(request_id, "grant_active", now, active_until=now + ttl)
+                            (expiry, request_id))
+            fields = {"active_until": expiry, "approved_by_discord_id": row["approved_by_discord_id"]}
+            if helper_outcome is not None:
+                fields["helper_outcome"] = helper_outcome
+            self._event(request_id, "grant_active", now, **fields)
         return self.get(request_id)
 
-    def mark_failed(self, request_id: str, error: str, now: float) -> sqlite3.Row:
+    def mark_completed(self, request_id: str, now: float, outcome: str) -> sqlite3.Row:
+        with self.db:
+            row = self.get(request_id)
+            if row["status"] != "executing":
+                raise StateError("request is not executing")
+            self.db.execute("UPDATE requests SET status='completed' WHERE id=?", (request_id,))
+            self._event(request_id, "configuration_applied", now, action=row["action"],
+                        approved_by_discord_id=row["approved_by_discord_id"], outcome=outcome)
+        return self.get(request_id)
+
+    def mark_failed(self, request_id: str, error: str, now: float,
+                    helper_outcome: str | None = None) -> sqlite3.Row:
         with self.db:
             row = self.get(request_id)
             if row["status"] not in ("approved", "executing"):
                 raise StateError("request cannot fail from this state")
             self.db.execute("UPDATE requests SET status='failed',last_error=? WHERE id=?", (error[:200], request_id))
-            self._event(request_id, "execution_failed", now, error=error[:200])
+            fields = {"error": error[:200]}
+            if helper_outcome is not None:
+                fields["helper_outcome"] = helper_outcome
+            self._event(request_id, "execution_failed", now, **fields)
         return self.get(request_id)
 
     def mark_rolled_back(self, request_id: str, now: float) -> sqlite3.Row:
@@ -189,7 +236,18 @@ class Store:
 
     def recovery_rows(self, now: float) -> list[sqlite3.Row]:
         return list(self.db.execute("""SELECT * FROM requests WHERE status IN ('approved','executing')
-              OR (status='active' AND active_until<=?) ORDER BY created_at""", (now,)))
+              OR (status='active' AND action='firewall_profile' AND active_until<=?) ORDER BY created_at""", (now,)))
+
+    def close_capture_grants(self, now: float, event: str, *, except_id: str | None = None) -> None:
+        if event not in ("capture_superseded", "capture_observed_disabled"):
+            raise StateError("invalid capture closure event")
+        next_status = "superseded" if event == "capture_superseded" else "closed"
+        with self.db:
+            rows = self.db.execute("""SELECT id FROM requests WHERE action='proxy_body_capture'
+                      AND status='active' AND id<>?""", (except_id or "",)).fetchall()
+            for row in rows:
+                self.db.execute("UPDATE requests SET status=? WHERE id=?", (next_status, row["id"]))
+                self._event(row["id"], event, now)
 
     def rollback_error(self, request_id: str, error: str, now: float) -> None:
         with self.db:
@@ -205,7 +263,9 @@ class Store:
         return result
 
     def flush_audit(self) -> int:
-        rows = list(self.db.execute("SELECT id,payload FROM audit_outbox WHERE flushed=0 ORDER BY rowid"))
+        rows = list(self.db.execute("""SELECT rowid AS seq,id,payload,'request' AS kind FROM audit_outbox WHERE flushed=0
+              UNION ALL SELECT rowid AS seq,id,payload,'operator' AS kind FROM operator_audit_outbox WHERE flushed=0
+              ORDER BY kind DESC,seq"""))
         if not rows:
             return 0
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
@@ -222,5 +282,8 @@ class Store:
         finally:
             os.close(fd)
         with self.db:
-            self.db.executemany("UPDATE audit_outbox SET flushed=1 WHERE id=?", [(row["id"],) for row in rows])
+            self.db.executemany("UPDATE audit_outbox SET flushed=1 WHERE id=?",
+                                [(row["id"],) for row in rows if row["kind"] == "request"])
+            self.db.executemany("UPDATE operator_audit_outbox SET flushed=1 WHERE id=?",
+                                [(row["id"],) for row in rows if row["kind"] == "operator"])
         return len(rows)

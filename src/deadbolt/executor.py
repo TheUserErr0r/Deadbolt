@@ -13,9 +13,10 @@ import pwd
 import socket
 import stat
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable
 
-from deadbolt.actions import ActionError, UfwAction
+from deadbolt.actions import ActionError, CaptureAction, CaptureError, ExclusionsAction, UfwAction
 from deadbolt.config import ConfigurationError, ExecutorConfig, Policy, resolve_action
 from deadbolt.protocol import MAX_MESSAGE_BYTES, ProtocolError, peer_uid, read_message, require_fields, write_message
 from deadbolt.store import StateError, Store, canonical_json
@@ -26,12 +27,16 @@ LOG = logging.getLogger(__name__)
 class Executor:
     def __init__(self, config: ExecutorConfig, policy: Policy, store: Store,
                  action: UfwAction | None = None, clock: Callable[[], float] = time.time,
-                 policy_loader: Callable[[], Policy] | None = None):
+                 policy_loader: Callable[[], Policy] | None = None,
+                 capture_action: CaptureAction | None = None,
+                 exclusions_action: ExclusionsAction | None = None):
         self.config = config
         self.policy = policy
         self.policy_loader = policy_loader or (lambda: Policy.load(config.profiles_path))
         self.store = store
         self.action = action or UfwAction()
+        self.capture_action = capture_action or CaptureAction()
+        self.exclusions_action = exclusions_action or ExclusionsAction()
         self.clock = clock
         self.lock = asyncio.Lock()
         bot_account = pwd.getpwnam(config.bot_user)
@@ -41,12 +46,17 @@ class Executor:
 
     def _revalidate(self, row: Any) -> dict[str, Any]:
         original = json.loads(row["canonical_json"])
+        capture = original["action"] == "proxy_body_capture"
+        exclusions = original["action"] == "body_capture_exclusions"
         current = resolve_action(original["action"], original["profile"], original["reason"],
-                                 original["ttl_seconds"], self.policy_loader(), self.config)
+                                 None if capture or exclusions else original["ttl_seconds"],
+                                 self.policy_loader(), self.config,
+                                 original.get("hours") if capture else None,
+                                 original.get("suffixes") if exclusions else None)
         if (canonical_json(current) != row["canonical_json"] or
                 hashlib.sha256(row["canonical_json"].encode()).hexdigest() != row["canonical_hash"]):
             raise StateError("stored action no longer matches root policy")
-        self.action.validate(current)
+        (self.capture_action if capture else self.exclusions_action if exclusions else self.action).validate(current)
         return current
 
     async def dispatch(self, message: dict[str, Any], uid: int) -> dict[str, Any]:
@@ -66,15 +76,19 @@ class Executor:
         op = message.get("op")
         now = self.clock()
         if op == "create":
-            require_fields(message, {"op", "action", "profile", "reason", "requested_by_uid"}, {"ttl_seconds"})
+            require_fields(message, {"op", "action", "profile", "reason", "requested_by_uid"},
+                           {"ttl_seconds", "hours", "suffixes"})
             if type(message["requested_by_uid"]) is not int or message["requested_by_uid"] != self.hermes_uid:
                 raise ProtocolError("invalid claimed request origin")
             if not all(isinstance(message[key], str) for key in ("action", "profile", "reason")):
                 raise ProtocolError("invalid request fields")
             canonical = resolve_action(message["action"], message["profile"], message["reason"],
-                                       message.get("ttl_seconds"), self.policy_loader(), self.config)
-            self.action.validate(canonical)
-            row = self.store.create(canonical, self.action.describe(canonical), self.hermes_uid, now)
+                                       message.get("ttl_seconds"), self.policy_loader(), self.config,
+                                       message.get("hours"), message.get("suffixes"))
+            action = (self.capture_action if canonical["action"] == "proxy_body_capture" else
+                      self.exclusions_action if canonical["action"] == "body_capture_exclusions" else self.action)
+            action.validate(canonical)
+            row = self.store.create(canonical, action.describe(canonical), self.hermes_uid, now)
             return {"ok": True, "request": self.store.public(row)}
         if op == "list":
             require_fields(message, {"op", "state"}, {"offset"})
@@ -105,11 +119,72 @@ class Executor:
             if row["status"] == "approved":
                 row = await self._execute(row)
             return {"ok": True, "request": self.store.public(row)}
+        if op in ("capture_status", "capture_disable"):
+            require_fields(message, {"op", "user_id", "guild_id", "channel_id", "interaction_id"})
+            self._operator(message)
+            capture_request_id = self.store.current_capture_request_id()
+            try:
+                result = (self.capture_action.status() if op == "capture_status"
+                          else self.capture_action.disable())
+            except ActionError as exc:
+                self.store.operator_event(op + "_failed", now, message["user_id"],
+                                          message["interaction_id"], error=str(exc),
+                                          request_id=capture_request_id,
+                                          helper_outcome=exc.outcome if isinstance(exc, CaptureError) else None)
+                raise
+            self.store.operator_event(op, self.clock(), message["user_id"],
+                                      message["interaction_id"], result=result,
+                                      request_id=capture_request_id)
+            if not result["enabled"]:
+                self.store.close_capture_grants(self.clock(), "capture_observed_disabled")
+            return {"ok": True, "capture": result}
         raise ProtocolError("unknown operation")
+
+    def _operator(self, message: dict[str, Any]) -> None:
+        if any(not isinstance(message[key], str) for key in
+               ("user_id", "guild_id", "channel_id", "interaction_id")):
+            raise ProtocolError("invalid operator fields")
+        if (message["user_id"], message["guild_id"], message["channel_id"]) != (
+                self.config.discord_user_id, self.config.discord_guild_id,
+                self.config.discord_channel_id):
+            raise ProtocolError("Discord actor or location is not allowed")
+        if not message["interaction_id"].isdecimal():
+            raise ProtocolError("invalid interaction ID")
 
     async def _execute(self, row: Any) -> Any:
         request_id = row["id"]
         now = self.clock()
+        if row["action"] == "proxy_body_capture":
+            try:
+                canonical = self._revalidate(row)
+                self.store.mark_executing(request_id, {"external_expiry": True}, now)
+                started = self.clock()
+                result = self.capture_action.enable(canonical)
+                finished = self.clock()
+                expiry = datetime.strptime(result["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=timezone.utc).timestamp()
+                if not started + canonical["ttl_seconds"] - 1 <= expiry <= finished + canonical["ttl_seconds"] + 1:
+                    raise ActionError("capture helper returned unexpected expiry")
+                active = self.store.mark_active(request_id, self.clock(), active_until=expiry,
+                                                helper_outcome=result["outcome"])
+                self.store.close_capture_grants(self.clock(), "capture_superseded", except_id=request_id)
+                return active
+            except (ActionError, ConfigurationError, StateError, OSError) as exc:
+                return self.store.mark_failed(request_id, str(exc), self.clock(),
+                    helper_outcome=exc.outcome if isinstance(exc, CaptureError) else None)
+        if row["action"] == "body_capture_exclusions":
+            try:
+                canonical = self._revalidate(row)
+                intent = self.exclusions_action.prepare(canonical)
+                self.store.mark_executing(request_id, intent, now)
+                self.exclusions_action.apply(canonical, intent)
+                return self.store.mark_completed(request_id, self.clock(), "replaced")
+            except (ActionError, ConfigurationError, StateError, OSError) as exc:
+                # A failed atomic replacement may already have committed. On
+                # restart, reconciliation compares the persisted before/after.
+                if self.store.get(request_id)["status"] == "executing":
+                    return self.store.get(request_id)
+                return self.store.mark_failed(request_id, str(exc), self.clock())
         try:
             canonical = self._revalidate(row)
             rollback = self.action.prepare(canonical, request_id)
@@ -136,6 +211,31 @@ class Executor:
             for row in self.store.recovery_rows(now):
                 if row["status"] == "approved":
                     self.store.mark_failed(row["id"], "executor stopped before apply", self.clock())
+                    continue
+                if row["action"] == "proxy_body_capture":
+                    self.store.mark_failed(row["id"], "capture execution interrupted; inspect helper status",
+                                           self.clock())
+                    continue
+                if row["action"] == "body_capture_exclusions":
+                    try:
+                        canonical = json.loads(row["canonical_json"])
+                        if hashlib.sha256(row["canonical_json"].encode()).hexdigest() != row["canonical_hash"]:
+                            raise StateError("stored exclusions approval hash changed")
+                        self.exclusions_action.validate(canonical)
+                        intent = json.loads(row["rollback_json"])
+                        expected = (self.exclusions_action.header +
+                                    "".join(f"{suffix}\n" for suffix in canonical["suffixes"]))
+                        if intent["after"] != expected:
+                            raise StateError("stored exclusions intent changed")
+                        current = self.exclusions_action._read()
+                        if current == intent["after"]:
+                            self.store.mark_completed(row["id"], self.clock(), "recovered_applied")
+                        elif hashlib.sha256(current.encode()).hexdigest() == intent["before_sha256"]:
+                            self.store.mark_failed(row["id"], "exclusions write interrupted", self.clock())
+                        else:
+                            self.store.rollback_error(row["id"], "exclusions changed externally", self.clock())
+                    except Exception:
+                        LOG.exception("exclusions reconciliation failed for %s", row["id"])
                     continue
                 try:
                     canonical = json.loads(row["canonical_json"])

@@ -1,6 +1,16 @@
 # Root-owned allow-list. Empty by default: no privileged action can be granted.
 [firewall_profiles]
 
+# Body capture remains disabled until the external root-owned helper and its
+# independent expiry timer are verified on the target host.
+[proxy_body_capture]
+enabled = false
+
+# A later exclusion edit is a separate, Discord-approved Deadbolt request.
+# Only suffixes in this root-owned list may be selected by that action.
+[body_capture_exclusions]
+allowed_suffixes = ["discord.com", "discordapp.com", "discordapp.net", "discordcdn.com"]
+
 # Replace the destination with an exact approved CIDR before enabling a profile.
 # [firewall_profiles.https-temporary]
 # direction = "out"

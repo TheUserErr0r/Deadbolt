@@ -4,7 +4,7 @@
 
 Human-approved, time-limited privileged actions for AI agents.
 
-Deadbolt v0.5 is an **undeployed local development release**. It accepts a small structured request from an unprivileged `hermes` user, relays it through a dedicated `deadbolt` Discord bot account, and lets a root executor apply only root-owned UFW profiles after a configured human approves. No generic command, destination, port, service name, or systemd unit can be supplied by Hermes. The repository deliberately contains no deployment credentials or real profiles.
+Deadbolt v0.5 is an **undeployed local development release**. It accepts a small structured request from an unprivileged `hermes` user, relays it through a dedicated `deadbolt` Discord bot account, and lets a root executor apply only root-owned profiles after a configured human approves. UFW profiles are supported; the body-capture adapter remains disabled in the example policy until its external helper is installed and tested. No generic command, destination, port, service name, or systemd unit can be supplied by Hermes. The repository deliberately contains no deployment credentials or real firewall profiles.
 
 ## Architecture
 
@@ -14,6 +14,8 @@ hermes -- /run/deadbolt/ingress/hermes.sock --> deadbolt bot (no sudo)
                                               | /run/deadbolt/bot.sock
                                               v
                                          root executor --> UFW
+                                                       --> fixed body-capture helper
+                                                       --> approved exclusion file
                                               |
                                          SQLite + JSONL audit
 ```
@@ -30,7 +32,7 @@ For an isolated installation, create a Python virtual environment and install `.
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-The local unit tests use temporary SQLite files and a fake UFW runner. They never alter the host firewall or contact Discord. The bot's `--dry-run` option prints approval cards without a token; it does not approve requests or change UFW rules. Running that relay still requires the dedicated Unix accounts and socket directories; use the unit tests for development on an ordinary workstation.
+The local unit tests use temporary SQLite files, a fake UFW runner, and a mocked body-capture helper. They never alter the host firewall, contact Discord, or invoke the real helper. The bot's `--dry-run` option prints approval cards without a token; it does not approve requests or change host policy. Running that relay still requires the dedicated Unix accounts and socket directories; use the unit tests for development on an ordinary workstation.
 
 ## GitHub Actions verification
 
@@ -38,7 +40,7 @@ The badge at the top shows the latest **push** result for [Deadbolt CI](.github/
 
 | Check | What it exercises | Runs on |
 | --- | --- | --- |
-| Unit | Policy, state, recovery, and mocked Discord approval interactions | Pull requests and pushes |
+| Unit | Policy, state, recovery, mocked Discord approval interactions, and mocked body-capture helper | Pull requests and pushes |
 | Unix sockets | Real `hermes` and `deadbolt` users, peer credentials, dry-run relay, denial, and audit records | Pushes |
 | UFW | Tagged rule application and rollback in a network-isolated Docker container | Pushes |
 
@@ -87,15 +89,39 @@ Each Unix-socket exchange is one newline-terminated JSON object of at most 16 Ki
 {"version":1,"op":"submit","action":"firewall_profile","profile":"approved-profile","reason":"Time-limited access for a named task","ttl_seconds":900}
 ```
 
-The bot forwards the request to root, including the UID obtained from peer credentials. Root checks the claimed UID, action and profile, resolves fixed UFW fields, clamps TTL, and returns a request ID. The Discord card shows the exact resolved rule, reason, effective TTL, request ID, and approval deadline. Only the configured Discord user in the configured guild and channel can approve or deny. `/deadbolt status <request-id>` and `/deadbolt deny <request-id>` provide fallbacks.
+The bot forwards the request to root, including the UID obtained from peer credentials. Root checks the claimed UID, action and profile, resolves fixed policy fields, and returns a request ID. The Discord card shows the exact resolved action, request ID, and approval deadline. Only the configured Discord user in the configured guild and channel can approve or deny. `/deadbolt status <request-id>` and `/deadbolt deny <request-id>` provide fallbacks.
 
-Pending approval expires after 10 minutes. Active TTL starts after successful application, defaults to 30 minutes, and is capped at 60 minutes and by the chosen profile. Expired grants are swept every five seconds; startup reconciliation runs before the executor accepts requests. If rollback fails, the record stays recoverable and the executor retries.
+### Body capture adapter
+
+After the root-owned helper and its **independent** expiry timer have been installed and verified on the target host, set `[proxy_body_capture] enabled = true` in the root-owned policy. Hermes can then request an approved enable:
+
+```json
+{"version":1,"op":"submit","action":"proxy_body_capture","profile":"proxy_body_capture","reason":"diagnostics","hours":2}
+```
+
+`hours` must be an integer from 1 through 24. Every enable requires a new Discord approval; the card shows the requested duration and warns that decrypted HTTP request and response bodies are retained on Argus for 24 hours. Deadbolt invokes only `/usr/local/sbin/hermes-body-capture --json enable HOURS`. The helper returns a single compact JSON line with exactly `enabled`, `expires_at` (whole-second RFC3339 UTC or null), and `outcome` (`enabled`, `disabled`, `status`, `expired`, `invalid_ttl`, or `internal_error`). Deadbolt records the helper's expiry, which replaces any prior expiry; it never extends from the old deadline. The helper and its root-owned systemd timer enforce expiry independently of Deadbolt. This repository does not install the helper, timer, log rotation, or Loki retention.
+
+Only the configured Discord operator may use `/deadbolt capture_status` and `/deadbolt capture_disable`. These commands call the fixed helper `--json status` and `--json disable` forms without a second approval. Hermes cannot reach them through the ingress socket. The bot and audit log receive only the validated structured result; helper stderr and raw output are discarded. Deadbolt deliberately does not persist or display Hermes's freeform reason for body-capture and exclusion requests, preventing accidental evidence or secret URLs from appearing in cards or audit records.
+
+### Body-only exclusions
+
+Install [the sample exclusion file](examples/body-capture-exclusions.conf) as `/etc/hermes-inspection-proxy/body-capture-exclusions.conf`, owned by `root:tlsproxy` with mode `0640`. It starts with `discord.com`, `discordapp.com`, `discordapp.net`, and `discordcdn.com`. The external proxy reads normalized DNS suffixes from this file, matches TLS SNI first and then HTTP Host, and suppresses **only** request and response body evidence for matching hosts. It must still proxy the traffic, retain metadata, and apply existing firewall rules. No wildcard, regex, IP address, port, URL, CIDR, or proxy-bypass setting is accepted by Deadbolt. The proxy rereads the file; no reload command is run.
+
+Later changes require a **separate approval**. The root-owned `[body_capture_exclusions] allowed_suffixes` policy limits which suffixes may be selected. A submitted replacement list uses this shape:
+
+```json
+{"version":1,"op":"submit","action":"body_capture_exclusions","profile":"body_capture_exclusions","reason":"reduce noise","suffixes":["discord.com","discordcdn.com"]}
+```
+
+Root canonicalizes and displays the full replacement list before approval, then atomically replaces only the fixed exclusion file. This is a permanent configuration edit with no active TTL; it never calls an arbitrary command. To permit a new hostname, an administrator must first add it to the root-owned policy. The example policy permits only the four initial Discord suffixes.
+
+Pending approval expires after 10 minutes. UFW active TTL starts after successful application, defaults to 30 minutes, and is capped at 60 minutes and by the chosen profile. Expired UFW grants are swept every five seconds; startup reconciliation runs before the executor accepts requests. If rollback fails, the record stays recoverable and the executor retries. Body-capture expiry is enforced by the external helper and timer, not by the Deadbolt sweep.
 
 ## Deployment templates
 
 Sanitized configuration lives in `examples/`; systemd templates live in `systemd/`. Production configuration belongs only in `/etc/deadbolt/`, with root-owned policy, state, and audit paths. The `deadbolt` account must be a dedicated non-login user with no sudo or privileged supplementary groups. `zeus` remains the human/operator account and is not used by the bot. The root executor is the only privileged process. The ingress directory is `deadbolt:hermes` mode `0750`; its socket is mode `0666` *inside that private directory* and still checks the peer UID. The root socket is `root:deadbolt` mode `0660` under a root-owned runtime directory.
 
-Install and run the tmpfiles definition before starting the units. It creates the private ingress directory and the UFW and iptables lock files needed by the executor's `ProtectSystem=strict` sandbox.
+Install and run the tmpfiles definition before starting the units. It creates the private ingress directory and the UFW and iptables lock files needed by the executor's `ProtectSystem=strict` sandbox. When testing body capture, ensure `/etc/hermes-inspection-proxy` exists. The executor unit permits atomic writes there for the fixed helper and approved exclusion file; the path is optional so UFW-only hosts can still start the unit.
 
 Do not deploy these templates to Hermes until the local tests, review, concrete root-owned UFW profiles, Discord IDs, and service permissions have been checked. Deployment source should be a pinned release under `/opt/deadbolt`, owned by root and not writable by `hermes` or `deadbolt`.
 
