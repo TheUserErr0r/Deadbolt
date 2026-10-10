@@ -2,6 +2,13 @@
 # Root-owned integration helper. Install at /usr/local/sbin/hermes-body-capture.
 set -eu
 
+# Internal marker used only by the child launched under flock.
+locked=false
+if [ "${1:-}" = "--lock-held" ]; then
+  locked=true
+  shift
+fi
+
 json=false
 if [ "${1:-}" = "--json" ]; then
   json=true
@@ -11,14 +18,31 @@ fi
 config=/etc/hermes-inspection-proxy/evidence.env
 lock=/etc/hermes-inspection-proxy/.body-capture.lock
 umask 027
-exec 9>>"$lock"
-if ! /usr/bin/flock -w 5 -x 9 >/dev/null 2>&1; then
+
+lock_error() {
   if $json; then
     printf '{"enabled":false,"expires_at":null,"outcome":"internal_error"}\n'
   else
     printf 'internal_error\n' >&2
   fi
   exit 1
+}
+
+if ! $locked; then
+  if $json; then
+    set -- --json "$@"
+  fi
+  if /usr/bin/flock -E 75 -w 5 -x "$lock" /bin/sh "$0" --lock-held "$@" 2>/dev/null; then
+    exit 0
+  else
+    result=$?
+  fi
+  # The child uses 1 and 2 for its own fixed failures. Other codes come from
+  # flock, including timeout and lock-file open failures.
+  case "$result" in
+    1|2) exit "$result" ;;
+    *) lock_error ;;
+  esac
 fi
 
 read_value() {

@@ -87,6 +87,17 @@ class ShippedCaptureHelperTests(unittest.TestCase):
         self.assertEqual(self.config.read_text().splitlines()[0], "HERMES_CAPTURE_BODIES=false")
         self.assertFalse(self.restarts.exists())
 
+    def test_lock_file_open_failure_returns_fixed_json_error(self) -> None:
+        self.helper.write_text(self.helper.read_text().replace(
+            str(self.base / "lock"), str(self.base / "missing" / "lock")))
+        result, response = self.call("--json", "enable", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(response, {"enabled": False, "expires_at": None,
+                                    "outcome": "internal_error"})
+        self.assertEqual(self.config.read_text().splitlines()[0], "HERMES_CAPTURE_BODIES=false")
+        self.assertFalse(self.restarts.exists())
+
     def test_expiry_timer_and_status_disable_due_or_corrupt_state(self) -> None:
         self.config.write_text("HERMES_CAPTURE_BODIES=true\n"
                                "HERMES_BODY_CAPTURE_MAX_BYTES=4096\n"
