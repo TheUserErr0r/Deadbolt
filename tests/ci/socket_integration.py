@@ -46,6 +46,7 @@ def wait_for_socket(path: Path, process: subprocess.Popen[str]) -> None:
 
 
 def main() -> None:
+    global SOURCE
     assert os.geteuid() == 0
     for user in ("deadbolt", "hermes"):
         subprocess.run(["useradd", "--system", "--user-group", "--no-create-home",
@@ -56,6 +57,10 @@ def main() -> None:
     runtime = Path(tempfile.mkdtemp(prefix="deadbolt-ci-runtime-"))
     os.chmod(runtime, 0o755)
     try:
+        # GitHub checks out source under /home/runner, which service users
+        # cannot traverse. Model deployment with a root-owned readable copy.
+        shutil.copytree(SOURCE, runtime / "src")
+        SOURCE = runtime / "src"
         with tempfile.TemporaryDirectory(prefix="deadbolt-ci-state-") as temp:
             base = Path(temp)
             ingress = runtime / "ingress"
