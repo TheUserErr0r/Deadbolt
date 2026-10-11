@@ -14,7 +14,9 @@ import stat
 import time
 from typing import Any, Awaitable, Callable
 
-from deadbolt.protocol import MAX_MESSAGE_BYTES, ProtocolError, peer_uid, read_message, require_fields, rpc, write_message
+from deadbolt.protocol import (EMERGENCY_RESPONSE_TIMEOUT_SECONDS, MAX_MESSAGE_BYTES,
+                               ProtocolError, peer_uid, read_message, require_fields, rpc,
+                               write_message)
 
 LOG = logging.getLogger(__name__)
 
@@ -46,13 +48,23 @@ class BotConfig:
 
 class Relay:
     def __init__(self, config: BotConfig,
-                 root_rpc: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] = rpc):
+                 root_rpc: Callable[..., Awaitable[dict[str, Any]]] = rpc):
         self.config = config
         self.root_rpc = root_rpc
+        self.root_call_lock = asyncio.Lock()
+        self.emergency_stops_in_progress = 0
         self.hermes_uid = pwd.getpwnam(config.hermes_user).pw_uid
 
-    async def root(self, payload: dict[str, Any]) -> dict[str, Any]:
-        response = await self.root_rpc(str(self.config.executor_socket), payload)
+    async def root(self, payload: dict[str, Any], *, emergency_response: bool = False) -> dict[str, Any]:
+        # Keep polling and other relay calls queued locally while a long root
+        # action runs, rather than opening sockets that expire before the
+        # executor's serialized action finishes.
+        async with self.root_call_lock:
+            if emergency_response:
+                response = await self.root_rpc(str(self.config.executor_socket), payload,
+                    response_timeout_seconds=EMERGENCY_RESPONSE_TIMEOUT_SECONDS)
+            else:
+                response = await self.root_rpc(str(self.config.executor_socket), payload)
         if not response.get("ok"):
             raise ProtocolError(str(response.get("error", "executor rejected request")))
         return response
@@ -60,6 +72,8 @@ class Relay:
     async def submit(self, message: dict[str, Any], uid: int) -> dict[str, Any]:
         if uid != self.hermes_uid:
             raise ProtocolError("unauthorized Unix peer")
+        if self.emergency_stops_in_progress:
+            raise ProtocolError("emergency stop in progress")
         require_fields(message, {"op", "action", "profile", "reason"}, {"ttl_seconds", "hours"})
         if message["op"] != "submit":
             raise ProtocolError("Hermes may only submit requests")
@@ -131,9 +145,16 @@ class Relay:
                                  guild_id: str, channel_id: str) -> dict[str, Any]:
         if operation not in ("emergency_status", "emergency_stop", "emergency_recover_create"):
             raise ProtocolError("invalid emergency operation")
-        response = await self.root({"op": operation, "interaction_id": interaction_id,
-                                    "user_id": user_id, "guild_id": guild_id,
-                                    "channel_id": channel_id})
+        if operation == "emergency_stop":
+            self.emergency_stops_in_progress += 1
+        try:
+            response = await self.root({"op": operation, "interaction_id": interaction_id,
+                                        "user_id": user_id, "guild_id": guild_id,
+                                        "channel_id": channel_id},
+                                       emergency_response=operation == "emergency_stop")
+        finally:
+            if operation == "emergency_stop":
+                self.emergency_stops_in_progress -= 1
         return response["request"] if operation == "emergency_recover_create" else response["emergency"]
 
     async def decide(self, row: dict[str, Any], decision: str, interaction_id: str,
@@ -142,7 +163,9 @@ class Relay:
                                  "nonce": row["nonce"], "canonical_hash": row["canonical_hash"],
                                  "user_id": user_id, "guild_id": guild_id, "channel_id": channel_id,
                                  "message_id": row["posted_message_id"],
-                                 "interaction_id": interaction_id}))["request"]
+                                 "interaction_id": interaction_id},
+                                 emergency_response=(decision == "approve" and
+                                                     row.get("action") == "emergency_recover")))["request"]
 
     async def decide_posted(self, card: dict[str, Any], decision: str, message_id: str,
                             interaction_id: str, user_id: str, guild_id: str,

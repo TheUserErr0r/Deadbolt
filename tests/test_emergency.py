@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -15,7 +16,7 @@ from deadbolt.actions import ActionError, EmergencyAction
 from deadbolt.bot import BotConfig, Relay
 from deadbolt.config import ConfigurationError, ExecutorConfig, Policy, normalize_workload_units
 from deadbolt.executor import Executor
-from deadbolt.protocol import ProtocolError
+from deadbolt.protocol import EMERGENCY_RESPONSE_TIMEOUT_SECONDS, ProtocolError
 from deadbolt.store import StateError, Store
 
 
@@ -103,6 +104,7 @@ class EmergencyTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.patcher.stop()
+        self.executor.close()
         self.store.close()
         self.temp.cleanup()
 
@@ -114,6 +116,10 @@ class EmergencyTests(unittest.TestCase):
             asyncio.run(self.executor.dispatch({"op": "emergency_stop", **self.operator}, 102))
         with self.assertRaises(ProtocolError):
             self.dispatch("emergency_stop", user_id="9")
+        with self.assertRaises(ProtocolError):
+            self.dispatch("emergency_stop", guild_id="9")
+        with self.assertRaises(ProtocolError):
+            self.dispatch("emergency_stop", channel_id="9")
         result = self.dispatch("emergency_stop")["emergency"]
         self.assertEqual(result["state"], "active")
         self.assertTrue(result["egress_block_enforced"])
@@ -127,6 +133,86 @@ class EmergencyTests(unittest.TestCase):
         self.assertIn("emergency_stop_active", [event["event"] for event in events])
         self.assertTrue(any(event["event"] == "emergency_stop_active" and
                             event["approved_by_discord_id"] == "1" for event in events))
+
+    def test_slow_stop_returns_verified_state_and_queues_polling(self) -> None:
+        self.assertGreaterEqual(EMERGENCY_RESPONSE_TIMEOUT_SECONDS, 70)
+
+        def slow_host(argv: list[str], input_text: str | None) -> subprocess.CompletedProcess[str]:
+            if argv[1:] == ["stop", "hermes-tls-proxy.service"]:
+                time.sleep(5.2)
+            return self.host(argv, input_text)
+
+        self.executor.emergency_action = EmergencyAction(102, slow_host)
+
+        async def exercise() -> None:
+            with patch("deadbolt.executor.peer_uid", return_value=101):
+                server = await asyncio.start_unix_server(self.executor.connection,
+                    str(self.config.bot_socket))
+                bot_config = BotConfig(self.base / "ingress.sock", self.config.bot_socket,
+                                       "hermes", "1", "2", "3", None, True)
+                with patch("deadbolt.bot.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=102)):
+                    relay = Relay(bot_config)
+                async with server:
+                    started = time.monotonic()
+                    stop = asyncio.create_task(relay.emergency_operator(
+                        "emergency_stop", "50", "1", "2", "3"))
+                    await asyncio.sleep(0.2)
+                    self.assertFalse(stop.done(), "executor blocked its event loop")
+                    self.assertTrue(self.host.blocked)
+                    polling = asyncio.create_task(relay.list_all("pending"))
+                    result = await asyncio.wait_for(stop, timeout=15)
+                    self.assertGreater(time.monotonic() - started, 5)
+                    self.assertEqual(result["state"], "active")
+                    self.assertTrue(result["egress_block_enforced"])
+                    self.assertFalse(self.host.units["hermes-tls-proxy.service"])
+                    self.assertFalse(self.host.units["hermes-worker.service"])
+                    self.assertEqual(await asyncio.wait_for(polling, timeout=3), [])
+
+        asyncio.run(exercise())
+
+    def test_stop_host_timeout_fails_and_preserves_egress_block(self) -> None:
+        def timed_out_host(argv: list[str], input_text: str | None) -> subprocess.CompletedProcess[str]:
+            if argv[1:] == ["stop", "hermes-tls-proxy.service"]:
+                raise subprocess.TimeoutExpired(argv, EmergencyAction.HOST_COMMAND_TIMEOUT_SECONDS)
+            return self.host(argv, input_text)
+
+        self.executor.emergency_action = EmergencyAction(102, timed_out_host)
+        with self.assertRaises(ActionError):
+            self.dispatch("emergency_stop")
+        self.assertTrue(self.host.blocked)
+        self.assertEqual(self.store.emergency_state()["state"], "stopping")
+        self.assertNotIn("emergency_stop_active", (self.base / "audit.jsonl").read_text())
+        self.assertIn("emergency_stop_failed", (self.base / "audit.jsonl").read_text())
+
+    def test_failed_stop_rpc_reports_failure_not_success(self) -> None:
+        def timed_out_host(argv: list[str], input_text: str | None) -> subprocess.CompletedProcess[str]:
+            if argv[1:] == ["stop", "hermes-tls-proxy.service"]:
+                raise subprocess.TimeoutExpired(argv, EmergencyAction.HOST_COMMAND_TIMEOUT_SECONDS)
+            return self.host(argv, input_text)
+
+        self.executor.emergency_action = EmergencyAction(102, timed_out_host)
+
+        async def exercise() -> None:
+            with patch("deadbolt.executor.peer_uid", return_value=101):
+                server = await asyncio.start_unix_server(self.executor.connection,
+                    str(self.config.bot_socket))
+                bot_config = BotConfig(self.base / "ingress.sock", self.config.bot_socket,
+                                       "hermes", "1", "2", "3", None, True)
+                with patch("deadbolt.bot.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=102)):
+                    relay = Relay(bot_config)
+                async with server:
+                    with self.assertRaisesRegex(ProtocolError, "emergency host command failed"):
+                        await relay.emergency_operator("emergency_stop", "50", "1", "2", "3")
+
+        asyncio.run(exercise())
+        self.assertTrue(self.host.blocked)
+        self.assertEqual(self.store.emergency_state()["state"], "stopping")
+
+    def test_emergency_host_process_timeout_is_sixty_seconds(self) -> None:
+        with patch("deadbolt.actions.subprocess.run", side_effect=subprocess.TimeoutExpired([], 60)) as run:
+            with self.assertRaises(ActionError):
+                EmergencyAction(102)._call(["/usr/bin/systemctl", "stop", "hermes-tls-proxy.service"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 60)
 
     def test_recovery_requires_separate_card_and_new_approval(self) -> None:
         self.dispatch("emergency_stop")

@@ -115,6 +115,7 @@ class CaptureExecutorTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.patch.stop()
+        self.executor.close()
         self.store.close()
         self.temp.cleanup()
 

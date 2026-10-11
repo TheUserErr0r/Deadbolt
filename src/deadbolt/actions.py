@@ -418,6 +418,7 @@ class EmergencyAction:
     chain = "output"
     comment = "deadbolt:emergency-stop"
     proxy_unit = "hermes-tls-proxy.service"
+    HOST_COMMAND_TIMEOUT_SECONDS = 60
 
     def __init__(self, hermes_uid: int,
                  runner: Callable[[list[str], str | None], subprocess.CompletedProcess[str]] | None = None):
@@ -427,7 +428,8 @@ class EmergencyAction:
     @staticmethod
     def _run_process(argv: list[str], input_text: str | None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(argv, input=input_text, shell=False, capture_output=True,
-                              text=True, timeout=15, check=False)
+                              text=True, timeout=EmergencyAction.HOST_COMMAND_TIMEOUT_SECONDS,
+                              check=False)
 
     def _call(self, argv: list[str], input_text: str | None = None) -> str:
         try:
@@ -512,6 +514,9 @@ class EmergencyAction:
             self._call(["/usr/bin/systemctl", "stop", unit])
         if self.active_units(workload_units):
             raise ActionError("emergency service remained active after stop")
+        # A slow service drain leaves time for external firewall changes. Do
+        # not report success unless the UID block is still present at the end.
+        self._install_block()
 
     def recover(self, previously_active: tuple[str, ...], workload_units: tuple[str, ...]) -> None:
         from deadbolt.config import normalize_workload_units
