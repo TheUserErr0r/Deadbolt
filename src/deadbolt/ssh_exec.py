@@ -18,13 +18,14 @@ import time
 import uuid
 from typing import Any, Callable
 
-from deadbolt.access import AccessError, SENSITIVE, command_argv
+from deadbolt.access import AccessError, MAX_COMMAND_SECONDS, SENSITIVE, command_argv
 
 
 MAX_OUTPUT_BYTES = 65536  # Per stdout/stderr stream; excess is drained and flagged.
+MAX_HERMES_OUTPUT_BYTES = 4096  # Per stream; keeps both base64 streams inside 16 KiB IPC.
 MAX_ROOT_RESULT_BYTES = 262144
 MAX_PROGRESS_WIRE_BYTES = 16 * 1024 * 1024  # Includes bounded frame overhead.
-MAX_EXECUTION_SECONDS = 60
+MAX_EXECUTION_SECONDS = MAX_COMMAND_SECONDS
 BROKER_CANCELLATION_DRAIN_SECONDS = 2
 BROKER_UNIT_APPEAR_SECONDS = 5
 REMOTE_RECEIVER = "/usr/local/libexec/deadbolt-remote-exec"
@@ -212,7 +213,8 @@ def _ssh_argv(record: dict[str, Any]) -> list[str]:
             "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={record['known_hosts']}",
             "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ClearAllForwardings=yes",
             "-o", "PermitLocalCommand=no", "-o", "ProxyCommand=none",
-            "-o", "ProxyJump=none", "-o", f"HostKeyAlias={record['destination']}",
+            "-o", "ProxyJump=none", "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3", "-o", f"HostKeyAlias={record['destination']}",
             "--", record["pinned_ip"], REMOTE_RECEIVER]
 
 
@@ -336,8 +338,22 @@ class SystemdSSHExecutor:
                     break
                 else:
                     raise AccessError("SSH unit creation remained uncertain after cancellation")
-        elif (load.returncode or load.stdout.strip() != "loaded" or state.returncode
-              or state.stdout.strip() not in ("inactive", "failed")):
+        elif load.returncode == 0 and load.stdout.strip() == "loaded":
+            # The unit may have appeared after the first ActiveState read.
+            # Never use that earlier state to confirm the loaded unit stopped.
+            try:
+                subprocess.run(["/usr/bin/systemctl", "stop", unit], shell=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=10, check=False)
+                state = subprocess.run(["/usr/bin/systemctl", "show",
+                    "--property=ActiveState", "--value", unit], shell=False,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=10, check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise AccessError("SSH unit cancellation failed") from exc
+            if state.returncode or state.stdout.strip() not in ("inactive", "failed"):
+                raise AccessError("SSH unit remained active after cancellation")
+        else:
             raise AccessError("SSH unit remained active after cancellation")
         if done is not None:
             done.wait(BROKER_CANCELLATION_DRAIN_SECONDS)
@@ -368,7 +384,10 @@ class SystemdSSHExecutor:
                         broker_gid=broker.pw_gid, private=True)
         _safe_root_file(canonical["known_hosts"], broker_uid=broker.pw_uid,
                         broker_gid=broker.pw_gid, private=False)
-        limit = max(1, min(MAX_EXECUTION_SECONDS, int(active_until - now)))
+        command_limit = canonical.get("max_command_seconds")
+        if type(command_limit) is not int or not 1 <= command_limit <= MAX_EXECUTION_SECONDS:
+            raise AccessError("invalid approved SSH command deadline")
+        limit = max(1, min(command_limit, int(active_until - now)))
         credential = {"version": 1, "request_id": request_id, "approval_id": approval_id,
                       "command_index": command_index, "destination": canonical["destination"],
                       "pinned_ip": canonical["pinned_ips"][0], "ssh_user": canonical["ssh_user"],
@@ -414,7 +433,7 @@ class SystemdSSHExecutor:
                       "CapabilityBoundingSet=", "AmbientCapabilities=",
                       "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
                       "IPAddressDeny=any", f"IPAddressAllow={address}/{prefix}",
-                      f"RuntimeMaxSec={limit}s", "TimeoutStopSec=5s",
+                      f"RuntimeMaxSec={limit + 10}s", "TimeoutStopSec=5s",
                       f"LoadCredential=request:{path}"]
         command_line = ["/usr/bin/systemd-run", "--quiet", "--wait", "--pipe", "--collect",
                         f"--unit={unit}", *(f"--property={item}" for item in properties),

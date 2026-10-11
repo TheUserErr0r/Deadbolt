@@ -15,7 +15,8 @@ from deadbolt.bot import BotConfig, Relay
 from deadbolt.broker_firewall import BrokerFirewall, BrokerFirewallError
 from deadbolt.config import ExecutorConfig, Policy
 from deadbolt.executor import Executor
-from deadbolt.ssh_exec import (CaptureResult, MAX_OUTPUT_BYTES, SystemdSSHExecutor,
+from deadbolt.protocol import SSH_RESPONSE_TIMEOUT_SECONDS
+from deadbolt.ssh_exec import (CaptureResult, MAX_HERMES_OUTPUT_BYTES, MAX_OUTPUT_BYTES, SystemdSSHExecutor,
                                 _capture_run, redact, run_child, _ssh_argv)
 from deadbolt.store import StateError, Store
 
@@ -46,9 +47,14 @@ class InputTests(unittest.TestCase):
             with self.subTest(command=command), self.assertRaises(AccessError):
                 command_argv(command)
         for override in ({"ports": [443]}, {"audited_execution": False},
-                         {"operator_approval": False}, {"max_commands": 0}):
+                         {"operator_approval": False}, {"max_commands": 0},
+                         {"max_command_seconds": 0}, {"max_command_seconds": 901},
+                         {"max_command_seconds": 600}):
             with self.subTest(override=override), self.assertRaises(AccessError):
                 profile(**override)
+        self.assertEqual(profile().max_command_seconds, 60)
+        self.assertEqual(profile(max_command_seconds=900, audit_output="full").max_command_seconds, 900)
+        self.assertGreaterEqual(SSH_RESPONSE_TIMEOUT_SECONDS, 990)
 
     def test_dns_boundary_and_mixed_answers(self):
         item = profile()
@@ -144,6 +150,23 @@ class FirewallTests(unittest.TestCase):
 
 
 class BrokerCancellationTests(unittest.TestCase):
+    def test_unit_appears_between_state_reads_and_is_stopped_again(self):
+        rid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        calls = []
+        def command(argv, **kwargs):
+            calls.append(argv)
+            if argv[1] == "stop":
+                return subprocess.CompletedProcess(argv, 1 if len(calls) == 1 else 0, "", "")
+            if "--property=LoadState" in argv:
+                return subprocess.CompletedProcess(argv, 0, "loaded\n", "")
+            return subprocess.CompletedProcess(argv, 0,
+                "inactive\n" if len(calls) == 2 or len(calls) == 5 else "active\n", "")
+        launcher = SystemdSSHExecutor()
+        with patch("deadbolt.ssh_exec.subprocess.run", side_effect=command):
+            launcher.cancel(rid, 1)
+        self.assertEqual([call[1] for call in calls],
+                         ["stop", "show", "show", "stop", "show"])
+
     def test_cancel_uses_fixed_unit_and_requires_inactive_state(self):
         rid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         unit = f"deadbolt-ssh-{rid}-1.service"
@@ -349,14 +372,19 @@ class SessionTests(unittest.TestCase):
         self.ssh = FullSSH()
         self.executor.ssh_executor = self.ssh
 
-    def test_full_evidence_stays_out_of_card_response_and_normal_audit(self):
+    def test_full_output_returns_to_hermes_after_evidence_without_entering_card_or_normal_audit(self):
         self._full_evidence_profile()
         row = self.request(["uptime", "token=argument-secret"])
         self.assertNotIn("argument-secret", row["description"])
         self.approve(row)
         response = self.execute(row, ["uptime", "token=argument-secret"])
         self.assertEqual(response["ssh"]["exit_code"], 0)
-        self.assertNotIn("secret", json.dumps(response))
+        self.assertEqual(base64.b64decode(response["ssh"]["stdout_b64"]), b"stdout-secret")
+        self.assertEqual(base64.b64decode(response["ssh"]["stderr_b64"]), b"stderr-secret")
+        self.assertEqual(response["ssh"]["output_encoding"], "base64")
+        self.assertFalse(response["ssh"]["stdout_truncated"])
+        self.assertFalse(response["ssh"]["stderr_truncated"])
+        self.assertNotIn("argument-secret", json.dumps(response))
         ordinary = self.store.audit_path.read_text()
         for secret in ("argument-secret", "stdout-secret", "stderr-secret"):
             self.assertNotIn(secret, ordinary)
@@ -364,6 +392,31 @@ class SessionTests(unittest.TestCase):
         self.assertIn("argument-secret", restricted)
         self.assertIn(base64.b64encode(b"stdout-secret").decode(), restricted)
         self.assertIn(base64.b64encode(b"stderr-secret").decode(), restricted)
+
+    def test_full_response_is_bounded_and_marks_return_truncation(self):
+        self._full_evidence_profile()
+        output = b"X" * MAX_OUTPUT_BYTES
+        error = b"Y" * (MAX_HERMES_OUTPUT_BYTES + 1)
+        original = self.ssh.execute
+        def large_result(*args):
+            result = original(*args)
+            result["stdout_b64"] = base64.b64encode(output).decode()
+            result["stderr_b64"] = base64.b64encode(error).decode()
+            return result
+        self.ssh.execute = large_result
+        row = self.request(["uptime"])
+        self.approve(row)
+        response = self.execute(row, ["uptime"])
+        self.assertEqual(base64.b64decode(response["ssh"]["stdout_b64"]),
+                         output[:MAX_HERMES_OUTPUT_BYTES])
+        self.assertEqual(base64.b64decode(response["ssh"]["stderr_b64"]),
+                         error[:MAX_HERMES_OUTPUT_BYTES])
+        self.assertTrue(response["ssh"]["stdout_truncated"])
+        self.assertTrue(response["ssh"]["stderr_truncated"])
+        self.assertLess(len(json.dumps({"version": 1, **response}).encode()), 16384)
+        evidence = (self.store.restricted_ssh_audit_path).read_text()
+        self.assertIn(base64.b64encode(output).decode(), evidence)
+        self.assertIn(base64.b64encode(error).decode(), evidence)
 
     def test_full_evidence_preflight_failure_prevents_execution(self):
         self._full_evidence_profile()
@@ -425,6 +478,25 @@ class SessionTests(unittest.TestCase):
 
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hermes_receives_bounded_full_result_with_long_rpc_deadline(self):
+        config = BotConfig(Path("/tmp/hermes.sock"), Path("/tmp/bot.sock"), "hermes",
+                           "1", "2", "3", None, True)
+        seen = []
+        async def root_rpc(path, payload, **kwargs):
+            seen.append((payload, kwargs))
+            return {"ok": True, "ssh": {"request_id": payload["request_id"],
+                "exit_code": 0, "command_index": 1, "finished_at": 1001,
+                "output_encoding": "base64", "stdout_b64": base64.b64encode(b"done").decode(),
+                "stderr_b64": "", "stdout_truncated": False, "stderr_truncated": False}}
+        with patch("deadbolt.bot.pwd.getpwnam",
+                   return_value=type("P", (), {"pw_uid": 100})()):
+            relay = Relay(config, root_rpc=root_rpc)
+        response = await relay.submit({"op": "ssh_execute", "request_id": "approved-id",
+            "destination": "192.168.1.4", "argv": ["uptime"]}, 100)
+        self.assertEqual(base64.b64decode(response["ssh"]["stdout_b64"]), b"done")
+        self.assertEqual(seen[0][0]["op"], "access_execute")
+        self.assertEqual(seen[0][1]["response_timeout_seconds"], SSH_RESPONSE_TIMEOUT_SECONDS)
+
     async def test_hermes_cannot_revoke_or_send_shell_string(self):
         config = BotConfig(Path("/tmp/hermes.sock"), Path("/tmp/bot.sock"), "hermes",
                            "1", "2", "3", None, True)
@@ -602,6 +674,28 @@ class SSHUnitTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(result["stderr_b64"]), b"password=err\xff")
         self.assertTrue(result["stderr_truncated"])
 
+    def test_child_allows_profile_bounded_command_over_one_minute(self):
+        record = {"version": 1, "request_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "approval_id": "55", "command_index": 1, "destination": "host.example",
+            "pinned_ip": "192.168.1.4", "ssh_user": "maintainer",
+            "ssh_key": "/etc/deadbolt/keys/maintainer",
+            "known_hosts": "/etc/deadbolt/known-hosts/managed",
+            "argv": ["uptime"], "audit_output": "full",
+            "expires_at": 1900, "timeout_seconds": 600}
+        identity = type("Account", (), {"pw_name": "deadbolt-ssh", "pw_uid": 104,
+                                        "pw_gid": 104})()
+        deadlines = []
+        def runner(argv, payload, timeout):
+            deadlines.append(timeout)
+            return CaptureResult(0, b"installed", b"", False, False, False)
+        with (patch("deadbolt.ssh_exec.pwd.getpwuid", return_value=identity),
+              patch("deadbolt.ssh_exec.pwd.getpwnam", return_value=identity),
+              patch("deadbolt.ssh_exec.os.geteuid", return_value=104),
+              patch("deadbolt.ssh_exec._safe_root_file")):
+            result = run_child(record, runner=runner, now=lambda: 1000)
+        self.assertEqual(deadlines, [600])
+        self.assertEqual(base64.b64decode(result["stdout_b64"]), b"installed")
+
     def test_fixed_receiver_no_tty_or_forwarding(self):
         argv = _ssh_argv({"ssh_user": "maintainer",
             "ssh_key": "/etc/deadbolt/keys/maintainer",
@@ -639,3 +733,28 @@ class SSHUnitTests(unittest.TestCase):
         self.assertIn("--property=IPAddressDeny=any", calls[0])
         self.assertIn("--property=IPAddressAllow=192.168.1.4/32", calls[0])
         self.assertIsNone(result["stdout_b64"])
+
+    def test_root_configured_long_foreground_command_remains_monitored(self):
+        rid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        canonical = canonical_access(profile(max_command_seconds=600, audit_output="full"),
+            "192.168.1.4", "install package", 900, ["uptime"])
+        calls = []
+        def runner(argv, payload, timeout, maximum):
+            calls.append((argv, timeout))
+            result = dict(request_id=rid, approval_id="55", command_index=1,
+                started_at=1000, finished_at=1001, destination="192.168.1.4",
+                pinned_ip="192.168.1.4", ssh_user="maintainer", command=["uptime"],
+                exit_code=0, termination="exit", timed_out=False, audit_output="full",
+                stdout_b64=base64.b64encode(b"install complete").decode(),
+                stderr_b64="", stdout_truncated=False,
+                stderr_truncated=False)
+            return 0, json.dumps(result) + "\n", ""
+        with tempfile.TemporaryDirectory() as path:
+            with patch("deadbolt.ssh_exec.pwd.getpwnam",
+                       return_value=type("A", (), {"pw_uid": 104, "pw_gid": 104})()), \
+                 patch("deadbolt.ssh_exec._safe_root_file"):
+                unit = SystemdSSHExecutor(Path(path), runner=runner,
+                                          owner_uid=Path(path).stat().st_uid)
+                unit.execute(canonical, rid, "55", 1, ["uptime"], 1900, 1000)
+        self.assertIn("--property=RuntimeMaxSec=610s", calls[0][0])
+        self.assertEqual(calls[0][1], 610)

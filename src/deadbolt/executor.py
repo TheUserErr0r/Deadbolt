@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import hashlib
@@ -24,10 +25,29 @@ from deadbolt.broker_firewall import BrokerFirewall, BrokerFirewallError
 from deadbolt.config import ConfigurationError, ExecutorConfig, Policy, describe_action, normalize_workload_units, resolve_action
 from deadbolt.protocol import MAX_MESSAGE_BYTES, ProtocolError, peer_uid, read_message, require_fields, write_message
 from deadbolt.store import StateError, Store, canonical_json
-from deadbolt.ssh_exec import SystemdSSHExecutor
+from deadbolt.ssh_exec import MAX_HERMES_OUTPUT_BYTES, MAX_OUTPUT_BYTES, SystemdSSHExecutor
 
 LOG = logging.getLogger(__name__)
 HOST_WORKER_WAKE_SECONDS = 0.25
+
+
+def _hermes_ssh_output(result: dict[str, Any]) -> dict[str, Any]:
+    """Return a small byte-exact prefix only after restricted evidence is durable."""
+    response: dict[str, Any] = {"output_encoding": "base64"}
+    for stream in ("stdout", "stderr"):
+        encoded = result[stream + "_b64"]
+        if not isinstance(encoded, str):
+            raise StateError("SSH result is missing restricted output")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise StateError("SSH result output encoding is invalid") from exc
+        if len(data) > MAX_OUTPUT_BYTES or type(result[stream + "_truncated"]) is not bool:
+            raise StateError("SSH result output exceeds policy")
+        response[stream + "_b64"] = base64.b64encode(data[:MAX_HERMES_OUTPUT_BYTES]).decode("ascii")
+        response[stream + "_truncated"] = (result[stream + "_truncated"]
+                                           or len(data) > MAX_HERMES_OUTPUT_BYTES)
+    return response
 
 
 class Executor:
@@ -381,6 +401,7 @@ class Executor:
                 canonical["pinned_ips"][0], row["id"], intent["expiry"])
             _, execution_id, command_index = self.store.begin_access_execution(row["id"], command, now)
             result = None
+            hermes_output = None
             failure = None
             finished = False
             try:
@@ -391,6 +412,8 @@ class Executor:
                 result = await self._host_call(self.ssh_executor.execute, canonical,
                     row["id"], row["interaction_id"], command_index, command,
                     row["active_until"], self.clock())
+                if canonical["audit_output"] == "full":
+                    hermes_output = _hermes_ssh_output(result)
                 if (self.store.emergency_state()["state"] != "inactive"
                         or self.store.get(row["id"])["status"] != "active"
                         or self.store.access_execution_state(execution_id) != "started"):
@@ -443,9 +466,11 @@ class Executor:
             if failure is not None:
                 raise ActionError(failure)
             assert result is not None
-            return {"ok": True, "ssh": {"request_id": row["id"], "exit_code": result["exit_code"],
-                                         "command_index": command_index,
-                                         "finished_at": result["finished_at"]}}
+            ssh_result = {"request_id": row["id"], "exit_code": result["exit_code"],
+                          "command_index": command_index, "finished_at": result["finished_at"]}
+            if hermes_output is not None:
+                ssh_result.update(hermes_output)
+            return {"ok": True, "ssh": ssh_result}
         if op == "decide":
             required = {"op", "request_id", "decision", "nonce", "canonical_hash", "user_id",
                         "guild_id", "channel_id", "message_id", "interaction_id"}

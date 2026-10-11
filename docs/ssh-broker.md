@@ -49,7 +49,12 @@ than 3600 seconds, `target_types` (`ip` and/or `dns`), canonical
 `/etc/deadbolt/keys/`, a known-hosts file under
 `/etc/deadbolt/known-hosts/`, a list of 1–16 receiver command names, and a
 `max_commands` limit from 1 to 100. `audit_output` is `metadata` by default;
-`full` requires the restricted sink below.
+`full` requires the restricted sink below. `max_command_seconds` defaults to
+60 and may be set by root from 1 through 900 seconds (15 minutes). It is
+included in the canonical approval description and hash. The active session
+TTL remains a separate limit; a command cannot run past the grant's expiry.
+Durations above 60 seconds require `audit_output="full"` and its restricted
+sink.
 The example is commented out. HTTP/HTTPS are durable baseline connectivity,
 so `https-web` and `https-api` are intentionally unavailable as temporary
 profiles.
@@ -89,8 +94,30 @@ receiver's root-owned command map, counted against the session limit, and
 audited individually. There is no shell string, interactive PTY, port
 forwarding, or direct Hermes SSH path. A command outside the list, a changed
 target, expired session, or exhausted count needs a **new** approval.
-The response contains only request ID, command index, exit code, and finish
-time; stdout/stderr never go to Hermes or Discord.
+For `audit_output="full"`, the response to **Hermes ingress only** includes
+request ID, command index, exit code, finish time, `output_encoding="base64"`,
+`stdout_b64`, `stderr_b64`, and separate `stdout_truncated` and
+`stderr_truncated` flags. Each decoded stream in the response is capped at
+**4,096 bytes** to fit the 16 KiB IPC frame. A truncation flag is true if
+either the response cap or the larger evidence cap discarded bytes. Binary
+bytes remain exact after base64 decoding. The response is sent only after
+the restricted completion event is durably appended; a restricted evidence
+failure yields no command output and revokes the session. Metadata-only
+profiles retain the earlier output-discarding response. Discord cards and
+operator replies never receive stdout or stderr. A timeout fails the command
+and revokes its grant; partial output remains in restricted evidence rather
+than being returned as a successful result.
+
+Long installation commands use a root-approved `max_command_seconds` up to
+900 with a session TTL that covers the expected run. The broker keeps the
+SSH connection and transient unit in the foreground, captures each bounded
+stream, and waits for a completion or timeout record. Hermes clients should
+allow at least **990 seconds** for an SSH response at the maximum profile
+limit. Other ordinary approval/status RPCs queue while one command occupies
+the executor; operator emergency stop uses its separate path and still
+preempts the broker. Target command wrappers must run in the foreground and
+must not fork detached jobs or redirect output away from the SSH channel.
+Such jobs would escape this evidence contract and must not be allow-listed.
 
 The configured Discord user in the configured guild/channel can use
 `/deadbolt status <request-id>` to inspect state and

@@ -23,6 +23,8 @@ MAX_ADDRESSES = 8
 MAX_ARGC = 16
 MAX_ARG_BYTES = 256
 MAX_COMMAND_BYTES = 2048
+DEFAULT_COMMAND_SECONDS = 60
+MAX_COMMAND_SECONDS = 900
 
 
 def destination(value: object) -> tuple[str, str]:
@@ -101,6 +103,7 @@ class AccessProfile:
     ssh_key: str | None = None
     known_hosts: str | None = None
     remote_commands: tuple[str, ...] = ()
+    max_command_seconds: int = DEFAULT_COMMAND_SECONDS
 
     @classmethod
     def from_mapping(cls, name: str, raw: object) -> "AccessProfile":
@@ -108,7 +111,8 @@ class AccessProfile:
             raise AccessError("invalid access profile")
         required = {"direction", "protocol", "ports", "max_ttl_seconds", "target_types",
                     "allowed_cidrs", "allow_public", "operator_approval", "audited_execution"}
-        optional = {"ssh_user", "ssh_key", "known_hosts", "remote_commands", "audit_output"}
+        optional = {"ssh_user", "ssh_key", "known_hosts", "remote_commands", "audit_output",
+                    "max_command_seconds"}
         required |= {"max_commands"}
         if set(raw) - required - optional or required - set(raw):
             raise AccessError("unexpected or missing access profile fields")
@@ -167,16 +171,21 @@ class AccessProfile:
             raise AccessError("only audited SSH family profiles are enabled in this version")
         maximum = raw.get("max_commands")
         audit_output = raw.get("audit_output", "metadata")
+        command_seconds = raw.get("max_command_seconds", DEFAULT_COMMAND_SECONDS)
         if type(maximum) is not int or not 1 <= maximum <= 100:
             raise AccessError("SSH profile requires a command limit from 1 to 100")
         if audit_output not in ("metadata", "full"):
             raise AccessError("invalid SSH output audit mode")
+        if type(command_seconds) is not int or not 1 <= command_seconds <= MAX_COMMAND_SECONDS:
+            raise AccessError("invalid SSH command deadline")
+        if command_seconds > DEFAULT_COMMAND_SECONDS and audit_output != "full":
+            raise AccessError("long SSH commands require restricted full evidence")
         if any(port in (80, 443) for port in ports):
             raise AccessError("baseline HTTP/HTTPS ports cannot be approval profiles")
         return cls(name, "out", raw["protocol"], tuple(sorted(ports)), ttl,
                    frozenset(types), tuple(networks), raw["allow_public"], True, ssh,
                    maximum, audit_output, extras["ssh_user"], extras["ssh_key"],
-                   extras["known_hosts"], tuple(commands))
+                   extras["known_hosts"], tuple(commands), command_seconds)
 
     def permits(self, address: str) -> bool:
         ip = ipaddress.ip_address(address)
@@ -233,6 +242,7 @@ def canonical_access(profile: AccessProfile, target: object, why: object, ttl: o
             "pinned_ips": addresses, "purpose": safe_purpose, "reason": safe_purpose,
             "ttl_seconds": ttl, "audited_execution": profile.audited_execution,
             "initial_command": command, "max_commands": profile.max_commands,
+            "max_command_seconds": profile.max_command_seconds,
             "audit_output": profile.audit_output,
             "ssh_user": profile.ssh_user, "ssh_key": profile.ssh_key,
             "known_hosts": profile.known_hosts,
@@ -247,7 +257,9 @@ def describe_access(record: dict[str, object]) -> str:
             f"Resolved pinned IPs: {', '.join(record['pinned_ips'])}\n"
             f"Protocol: {record['protocol']}\nPorts: {', '.join(map(str, record['ports']))}\n"
             f"SSH user: {record['ssh_user']}\nActive TTL: {record['ttl_seconds']} seconds\n"
-            f"Command limit: {record['max_commands']}\nPurpose: {record['purpose']}\n"
+            f"Command limit: {record['max_commands']}\n"
+            f"Maximum per-command runtime: {record['max_command_seconds']} seconds\n"
+            f"Purpose: {record['purpose']}\n"
             f"First command: {summary['name']} ({summary['argument_count']} arguments; "
             f"argv SHA-256: {summary['argv_sha256']})\nFurther allowed commands need no new approval. "
             "Each is validated and audited separately.")
