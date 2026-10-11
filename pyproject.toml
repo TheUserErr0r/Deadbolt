@@ -17,6 +17,9 @@ bot = ["discord.py>=2.4,<3"]
 deadbolt-executor = "deadbolt.executor:main"
 deadbolt-bot = "deadbolt.bot:main"
 deadbolt-emergency-restore = "deadbolt.emergency_restore:main"
+deadbolt-baseline = "deadbolt.baseline:main"
+deadbolt-ssh-child = "deadbolt.ssh_exec:child_main"
+deadbolt-ssh-guard = "deadbolt.ssh_guard:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

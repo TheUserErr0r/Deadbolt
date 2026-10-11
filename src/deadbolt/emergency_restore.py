@@ -9,7 +9,7 @@ import pwd
 import time
 
 from deadbolt.actions import EmergencyAction
-from deadbolt.config import ExecutorConfig
+from deadbolt.config import ExecutorConfig, Policy
 from deadbolt.executor import _secure_root_path
 from deadbolt.store import Store
 
@@ -24,7 +24,15 @@ def restore(config: ExecutorConfig) -> None:
     try:
         state = store.emergency_state()
         if state["state"] != "inactive":
-            action = EmergencyAction(pwd.getpwnam(config.hermes_user).pw_uid)
+            policy = Policy.load(config.profiles_path)
+            try:
+                broker_uid = pwd.getpwnam("deadbolt-ssh").pw_uid
+            except KeyError:
+                if policy.access_profiles:
+                    raise RuntimeError("deadbolt-ssh account is required to restore emergency block")
+                broker_uid = None
+            action = EmergencyAction(pwd.getpwnam(config.hermes_user).pw_uid,
+                                     broker_uid=broker_uid)
             try:
                 action.enforce(tuple(state["workload_units"]))
             except Exception:

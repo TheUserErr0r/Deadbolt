@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import hashlib
@@ -19,12 +20,34 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from deadbolt.actions import ActionError, CaptureAction, CaptureError, EmergencyAction, ExclusionsAction, UfwAction
+from deadbolt.access import AccessError, canonical_access, command_argv, describe_access, destination
+from deadbolt.broker_firewall import BrokerFirewall, BrokerFirewallError
 from deadbolt.config import ConfigurationError, ExecutorConfig, Policy, describe_action, normalize_workload_units, resolve_action
 from deadbolt.protocol import MAX_MESSAGE_BYTES, ProtocolError, peer_uid, read_message, require_fields, write_message
 from deadbolt.store import StateError, Store, canonical_json
+from deadbolt.ssh_exec import MAX_HERMES_OUTPUT_BYTES, MAX_OUTPUT_BYTES, SystemdSSHExecutor
 
 LOG = logging.getLogger(__name__)
 HOST_WORKER_WAKE_SECONDS = 0.25
+
+
+def _hermes_ssh_output(result: dict[str, Any]) -> dict[str, Any]:
+    """Return a small byte-exact prefix only after restricted evidence is durable."""
+    response: dict[str, Any] = {"output_encoding": "base64"}
+    for stream in ("stdout", "stderr"):
+        encoded = result[stream + "_b64"]
+        if not isinstance(encoded, str):
+            raise StateError("SSH result is missing restricted output")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise StateError("SSH result output encoding is invalid") from exc
+        if len(data) > MAX_OUTPUT_BYTES or type(result[stream + "_truncated"]) is not bool:
+            raise StateError("SSH result output exceeds policy")
+        response[stream + "_b64"] = base64.b64encode(data[:MAX_HERMES_OUTPUT_BYTES]).decode("ascii")
+        response[stream + "_truncated"] = (result[stream + "_truncated"]
+                                           or len(data) > MAX_HERMES_OUTPUT_BYTES)
+    return response
 
 
 class Executor:
@@ -33,25 +56,38 @@ class Executor:
                  policy_loader: Callable[[], Policy] | None = None,
                  capture_action: CaptureAction | None = None,
                  exclusions_action: ExclusionsAction | None = None,
-                 emergency_action: EmergencyAction | None = None):
+                 emergency_action: EmergencyAction | None = None,
+                 access_action: BrokerFirewall | None = None,
+                 ssh_executor: SystemdSSHExecutor | None = None):
         self.config = config
         self.policy = policy
         self.policy_loader = policy_loader or (lambda: Policy.load(config.profiles_path))
         self.store = store
         self.action = action or UfwAction()
+        try:
+            broker_uid = pwd.getpwnam("deadbolt-ssh").pw_uid
+        except KeyError:
+            if policy.access_profiles:
+                raise ConfigurationError("deadbolt-ssh account is required for access profiles")
+            broker_uid = None
+        self.access_action = access_action or (BrokerFirewall(broker_uid) if broker_uid and policy.access_profiles else None)
+        self.ssh_executor = ssh_executor or SystemdSSHExecutor()
         self.capture_action = capture_action or CaptureAction()
         self.exclusions_action = exclusions_action or ExclusionsAction()
         self.clock = clock
         self.lock = asyncio.Lock()
+        self.emergency_lock = asyncio.Lock()
         bot_account = pwd.getpwnam(config.bot_user)
         self.bot_uid = bot_account.pw_uid
         self.bot_gid = bot_account.pw_gid
         self.hermes_uid = pwd.getpwnam(config.hermes_user).pw_uid
-        self.emergency_action = emergency_action or EmergencyAction(self.hermes_uid)
+        self.emergency_action = emergency_action or EmergencyAction(self.hermes_uid,
+            broker_uid=broker_uid)
         self.host_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deadbolt-host")
+        self.emergency_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deadbolt-emergency")
 
-    async def _host_call(self, func: Callable[..., Any], *args: Any) -> Any:
-        future = asyncio.get_running_loop().run_in_executor(self.host_pool, partial(func, *args))
+    async def _pool_call(self, pool: ThreadPoolExecutor, func: Callable[..., Any], *args: Any) -> Any:
+        future = asyncio.get_running_loop().run_in_executor(pool, partial(func, *args))
         # A timed wait keeps the event loop responsive even when a worker
         # completion notification is delayed. Shielding leaves the host
         # operation running until its own fixed subprocess deadline.
@@ -61,8 +97,15 @@ class Executor:
             except asyncio.TimeoutError:
                 continue
 
+    async def _host_call(self, func: Callable[..., Any], *args: Any) -> Any:
+        return await self._pool_call(self.host_pool, func, *args)
+
+    async def _emergency_call(self, func: Callable[..., Any], *args: Any) -> Any:
+        return await self._pool_call(self.emergency_pool, func, *args)
+
     def close(self) -> None:
         self.host_pool.shutdown(wait=False, cancel_futures=True)
+        self.emergency_pool.shutdown(wait=False, cancel_futures=True)
 
     def _revalidate(self, row: Any) -> dict[str, Any]:
         original = json.loads(row["canonical_json"])
@@ -72,6 +115,14 @@ class Executor:
         if original["action"] == "emergency_recover":
             state = self.store.emergency_state()
             current = self._recovery_canonical(state, policy)
+        elif original["action"] == "access_grant":
+            profile = (policy.access_profiles or {}).get(original["profile"])
+            if profile is None:
+                raise StateError("access profile is no longer allowed")
+            if profile.audit_output == "full" and self.store.restricted_ssh_audit_path is None:
+                raise StateError("restricted SSH audit sink is not configured")
+            current = canonical_access(profile, original["destination"], original["purpose"],
+                                       original["ttl_seconds"], original["initial_command"])
         elif exclusions:
             self.exclusions_action.validate(original)
             if (original["hostname"] not in policy.body_exclusion_allowed_hosts
@@ -86,8 +137,9 @@ class Executor:
         if (canonical_json(current) != row["canonical_json"] or
                 hashlib.sha256(row["canonical_json"].encode()).hexdigest() != row["canonical_hash"]):
             raise StateError("stored action no longer matches root policy")
-        if original["action"] != "emergency_recover":
-            (self.capture_action if capture else self.exclusions_action if exclusions else self.action).validate(current)
+        if original["action"] not in ("emergency_recover", "access_grant"):
+            (self.capture_action if capture else self.exclusions_action if exclusions else
+             self.action).validate(current)
         return current
 
     @staticmethod
@@ -107,6 +159,15 @@ class Executor:
     async def dispatch(self, message: dict[str, Any], uid: int) -> dict[str, Any]:
         if uid != self.bot_uid:
             raise ProtocolError("unauthorized Unix peer")
+        if message.get("op") == "emergency_stop":
+            async with self.emergency_lock:
+                try:
+                    return await self._emergency_stop(message)
+                finally:
+                    try:
+                        self.store.flush_audit()
+                    except OSError:
+                        LOG.exception("audit JSONL flush failed; durable outbox will retry")
         async with self.lock:
             try:
                 result = await self._dispatch_locked(message)
@@ -117,23 +178,112 @@ class Executor:
                     LOG.exception("audit JSONL flush failed; durable outbox will retry")
             return result
 
+    async def _emergency_stop(self, message: dict[str, Any]) -> dict[str, Any]:
+        require_fields(message, {"op", "user_id", "guild_id", "channel_id", "interaction_id"})
+        self._operator(message)
+        now = self.clock()
+        state = self.store.emergency_state()
+        first_stop = state["state"] == "inactive"
+        if first_stop:
+            units = self.policy_loader().emergency_workload_units
+            state = self.store.emergency_transition(("inactive",), "stopping",
+                "emergency_stop_started", now, operator_id=message["user_id"],
+                interaction_id=message["interaction_id"], workload_units=units,
+                previously_active=(), next_generation=True)
+        try:
+            # Block both UIDs before touching a broker unit or a slow proxy.
+            await self._emergency_call(self.emergency_action.install_block)
+            if first_stop:
+                previous = await self._emergency_call(self.emergency_action.active_units, units)
+                state = self.store.emergency_transition(("stopping",), "stopping",
+                    "emergency_stop_units_recorded", self.clock(),
+                    operator_id=message["user_id"], interaction_id=message["interaction_id"],
+                    previously_active=previous)
+            failures: list[str] = []
+            for execution in self.store.interrupted_access_executions():
+                partial = None
+                try:
+                    partial = await self._emergency_call(self.ssh_executor.cancel,
+                        execution["request_id"], execution["command_index"])
+                except Exception:
+                    failures.append("SSH unit cancellation failed")
+                if self.store.access_execution_state(execution["id"]) == "started":
+                    try:
+                        self.store.interrupt_access_execution(execution["id"], self.clock(), partial)
+                    except Exception:
+                        failures.append("SSH interruption evidence could not be queued")
+            try:
+                self.store.flush_restricted_audit()
+            except Exception:
+                failures.append("SSH interruption evidence delivery failed")
+            for row in self.store.access_revoke_rows():
+                try:
+                    row = self.store.begin_access_revoke(row["id"], self.clock(), message["user_id"])
+                    intent = json.loads(row["rollback_json"])
+                    assert self.access_action is not None
+                    await self._emergency_call(self.access_action.revoke,
+                        intent["pinned_ip"], row["id"], intent["expiry"])
+                    self.store.mark_revoked(row["id"], self.clock(), message["user_id"])
+                except Exception:
+                    self.store.rollback_error(row["id"], "emergency SSH revocation requires inspection", self.clock())
+                    failures.append("SSH grant revocation failed")
+            await self._emergency_call(self.emergency_action.enforce,
+                tuple(state["workload_units"]))
+            if self.store.access_revoke_rows():
+                failures.append("active SSH grants remain")
+            if failures:
+                raise ActionError("; ".join(sorted(set(failures))))
+        except Exception as exc:
+            error = str(exc) if isinstance(exc, (ActionError, StateError, BrokerFirewallError)) else "internal emergency stop error"
+            self.store.emergency_event("emergency_stop_failed", self.clock(),
+                operator_id=message["user_id"], interaction_id=message["interaction_id"], error=error)
+            raise ActionError(error) from exc
+        if state["state"] != "active":
+            state = self.store.emergency_transition(("stopping", "recovering"), "active",
+                "emergency_stop_active", self.clock(), operator_id=message["user_id"],
+                interaction_id=message["interaction_id"])
+        else:
+            self.store.emergency_event("emergency_stop_idempotent", self.clock(),
+                operator_id=message["user_id"], interaction_id=message["interaction_id"])
+        return {"ok": True, "emergency": {**state, "egress_block_enforced": True,
+                                             "running_units": []}}
+
     async def _dispatch_locked(self, message: dict[str, Any]) -> dict[str, Any]:
         op = message.get("op")
         now = self.clock()
         if op == "create":
             require_fields(message, {"op", "action", "profile", "reason", "requested_by_uid"},
-                           {"ttl_seconds", "hours"})
+                           {"ttl_seconds", "hours", "destination", "purpose", "command"})
             if type(message["requested_by_uid"]) is not int or message["requested_by_uid"] != self.hermes_uid:
                 raise ProtocolError("invalid claimed request origin")
             if not all(isinstance(message[key], str) for key in ("action", "profile", "reason")):
                 raise ProtocolError("invalid request fields")
-            canonical = resolve_action(message["action"], message["profile"], message["reason"],
-                                       message.get("ttl_seconds"), self.policy_loader(), self.config,
-                                       message.get("hours"))
-            action = (self.capture_action if canonical["action"] == "proxy_body_capture" else
-                      self.action)
-            action.validate(canonical)
-            row = self.store.create(canonical, action.describe(canonical), self.hermes_uid, now)
+            if message["action"] == "access_grant":
+                require_fields(message, {"op", "action", "profile", "reason", "requested_by_uid",
+                                         "destination", "purpose", "ttl_seconds", "command"})
+                if message["reason"] != message["purpose"]:
+                    raise ProtocolError("access purpose mismatch")
+                profile = (self.policy_loader().access_profiles or {}).get(message["profile"])
+                if profile is None:
+                    raise AccessError("access profile is not allowed")
+                if self.access_action is None:
+                    raise AccessError("SSH broker is not initialized; restart the executor")
+                if profile.audit_output == "full" and self.store.restricted_ssh_audit_path is None:
+                    raise AccessError("restricted SSH audit sink is not configured")
+                canonical = canonical_access(profile, message["destination"], message["purpose"],
+                                             message["ttl_seconds"], message.get("command"))
+                description = describe_access(canonical)
+            else:
+                if set(message) & {"destination", "purpose", "command"}:
+                    raise ProtocolError("unexpected access fields")
+                canonical = resolve_action(message["action"], message["profile"], message["reason"],
+                                           message.get("ttl_seconds"), self.policy_loader(), self.config,
+                                           message.get("hours"))
+                action = (self.capture_action if canonical["action"] == "proxy_body_capture" else
+                          self.action)
+                action.validate(canonical)
+                description = action.describe(canonical)
+            row = self.store.create(canonical, description, self.hermes_uid, now)
             return {"ok": True, "request": self.store.public(row)}
         if op == "exclusion_create":
             require_fields(message, {"op", "operation", "hostname", "user_id", "guild_id",
@@ -152,7 +302,7 @@ class Executor:
             row = self.store.create(canonical, self.exclusions_action.describe(canonical),
                                     self.bot_uid, now, requested_by_discord_id=message["user_id"])
             return {"ok": True, "request": self.store.public(row)}
-        if op in ("emergency_status", "emergency_stop", "emergency_recover_create"):
+        if op in ("emergency_status", "emergency_recover_create"):
             require_fields(message, {"op", "user_id", "guild_id", "channel_id", "interaction_id"})
             self._operator(message)
             if op == "emergency_status":
@@ -170,38 +320,6 @@ class Executor:
                     operator_id=message["user_id"], interaction_id=message["interaction_id"])
                 return {"ok": True, "emergency": {**state, "egress_block_enforced": enforced,
                                                      "running_units": list(running)}}
-            if op == "emergency_stop":
-                state = self.store.emergency_state()
-                if state["state"] == "inactive":
-                    units = self.policy_loader().emergency_workload_units
-                    try:
-                        previous = await self._host_call(self.emergency_action.active_units, units)
-                    except ActionError as exc:
-                        self.store.emergency_event("emergency_stop_failed", now,
-                            operator_id=message["user_id"], interaction_id=message["interaction_id"],
-                            error=str(exc))
-                        raise
-                    state = self.store.emergency_transition(("inactive",), "stopping",
-                        "emergency_stop_started", now, operator_id=message["user_id"],
-                        interaction_id=message["interaction_id"], workload_units=units,
-                        previously_active=previous, next_generation=True)
-                try:
-                    await self._host_call(self.emergency_action.enforce,
-                                            tuple(state["workload_units"]))
-                except ActionError as exc:
-                    self.store.emergency_event("emergency_stop_failed", self.clock(),
-                        operator_id=message["user_id"], interaction_id=message["interaction_id"],
-                        error=str(exc))
-                    raise
-                if state["state"] != "active":
-                    state = self.store.emergency_transition(("stopping", "recovering"), "active",
-                        "emergency_stop_active", self.clock(), operator_id=message["user_id"],
-                        interaction_id=message["interaction_id"])
-                else:
-                    self.store.emergency_event("emergency_stop_idempotent", self.clock(),
-                        operator_id=message["user_id"], interaction_id=message["interaction_id"])
-                return {"ok": True, "emergency": {**state, "egress_block_enforced": True,
-                                                     "running_units": []}}
             state = self.store.emergency_state()
             try:
                 canonical = self._recovery_canonical(state, self.policy_loader())
@@ -226,6 +344,133 @@ class Executor:
             require_fields(message, {"op", "request_id"})
             row = self.store.get(message["request_id"])
             return {"ok": True, "request": self.store.public(row)}
+        if op == "access_revoke":
+            require_fields(message, {"op", "request_id", "user_id", "guild_id", "channel_id", "interaction_id"})
+            self._operator(message)
+            row = self.store.get(message["request_id"])
+            if row["action"] != "access_grant":
+                raise StateError("request is not a parameterized access grant")
+            if row["status"] in ("revoked", "rolled_back"):
+                return {"ok": True, "request": self.store.public(row)}
+            if row["status"] not in ("active", "revoking"):
+                raise StateError("access grant is not active")
+            row = self.store.begin_access_revoke(row["id"], now, message["user_id"])
+            try:
+                canonical = json.loads(row["canonical_json"])
+                intent = json.loads(row["rollback_json"])
+                assert self.access_action is not None
+                await self._host_call(self.access_action.revoke,
+                    canonical["pinned_ips"][0], row["id"], intent["expiry"])
+            except (BrokerFirewallError, OSError, ValueError) as exc:
+                self.store.rollback_error(row["id"], str(exc), now)
+                raise
+            row = self.store.mark_revoked(row["id"], self.clock(), message["user_id"])
+            return {"ok": True, "request": self.store.public(row)}
+        if op == "access_execute":
+            require_fields(message, {"op", "request_id", "requested_by_uid", "destination", "argv"})
+            if type(message["requested_by_uid"]) is not int or message["requested_by_uid"] != self.hermes_uid:
+                raise ProtocolError("invalid claimed request origin")
+            if self.store.emergency_state()["state"] != "inactive":
+                raise StateError("emergency stop blocks SSH execution")
+            row = self.store.get(message["request_id"])
+            if row["action"] != "access_grant" or row["status"] != "active" or row["active_until"] <= now:
+                raise StateError("approved SSH grant is absent or expired")
+            try:
+                canonical = self._revalidate(row)
+            except (AccessError, StateError, ConfigurationError):
+                intent = json.loads(row["rollback_json"])
+                assert self.access_action is not None
+                try:
+                    await self._host_call(self.access_action.revoke,
+                        intent["pinned_ip"], row["id"], intent["expiry"])
+                    self.store.mark_rolled_back(row["id"], self.clock())
+                except Exception:
+                    self.store.rollback_error(row["id"], "SSH policy drift requires grant inspection", self.clock())
+                raise
+            if destination(message["destination"])[0] != canonical["destination"]:
+                raise StateError("SSH destination differs from approved session")
+            command = command_argv(message["argv"],
+                                   allow_sensitive=canonical["audit_output"] == "full")
+            if command[0] not in canonical["remote_commands"]:
+                raise StateError("command requires a new approval")
+            if not canonical["audited_execution"] or len(canonical["pinned_ips"]) != 1:
+                raise StateError("grant does not permit noninteractive SSH")
+            intent = json.loads(row["rollback_json"])
+            assert self.access_action is not None
+            await self._host_call(self.access_action.assert_grant,
+                canonical["pinned_ips"][0], row["id"], intent["expiry"])
+            _, execution_id, command_index = self.store.begin_access_execution(row["id"], command, now)
+            result = None
+            hermes_output = None
+            failure = None
+            finished = False
+            try:
+                # The audit preflight must reach the root-owned JSONL file before SSH starts.
+                if canonical["audit_output"] == "full":
+                    self.store.flush_restricted_audit()
+                self.store.flush_audit()
+                result = await self._host_call(self.ssh_executor.execute, canonical,
+                    row["id"], row["interaction_id"], command_index, command,
+                    row["active_until"], self.clock())
+                if canonical["audit_output"] == "full":
+                    hermes_output = _hermes_ssh_output(result)
+                if (self.store.emergency_state()["state"] != "inactive"
+                        or self.store.get(row["id"])["status"] != "active"
+                        or self.store.access_execution_state(execution_id) != "started"):
+                    raise StateError("SSH command interrupted by emergency stop or grant revocation")
+                self.store.finish_access_execution(execution_id, self.clock(), result)
+                if canonical["audit_output"] == "full":
+                    self.store.flush_restricted_audit()
+                    self.store.finalize_access_execution(execution_id, self.clock())
+                finished = True
+                self.store.flush_audit()
+                if result.get("timed_out"):
+                    raise ActionError("SSH command timed out")
+            except Exception as exc:
+                try:
+                    execution_state = self.store.access_execution_state(execution_id)
+                except Exception:
+                    execution_state = "unknown"
+                evidence_pending = execution_state == "evidence_pending"
+                failure = ("restricted SSH evidence delivery failed; inspect session"
+                           if evidence_pending else str(exc) if isinstance(exc, (ActionError,
+                               AccessError, StateError, OSError, TimeoutError))
+                           else "internal SSH execution error")
+                # An uncertain command or audit delivery failure closes the
+                # session. Revoke first even if SQLite has become unwritable.
+                revoked = False
+                try:
+                    await self._host_call(self.access_action.revoke,
+                        intent["pinned_ip"], row["id"], intent["expiry"])
+                    revoked = True
+                except Exception:
+                    LOG.exception("SSH grant revocation failed after command failure")
+                try:
+                    if not finished and execution_state in ("started", "evidence_pending"):
+                        self.store.fail_access_execution(execution_id, self.clock(), failure)
+                    if revoked and self.store.get(row["id"])["status"] in ("active", "executing"):
+                        self.store.mark_rolled_back(row["id"], self.clock())
+                    if evidence_pending or not revoked:
+                        self.store.rollback_error(row["id"], failure if revoked else
+                            "SSH grant revocation failed; inspect host", self.clock())
+                except Exception:
+                    LOG.exception("SSH failure state could not be persisted")
+                    if not revoked:
+                        failure = "SSH grant revocation failed; inspect host"
+                if not revoked:
+                    try:
+                        self.store.rollback_error(row["id"],
+                            "SSH grant revocation failed; inspect host", self.clock())
+                    except Exception:
+                        pass
+            if failure is not None:
+                raise ActionError(failure)
+            assert result is not None
+            ssh_result = {"request_id": row["id"], "exit_code": result["exit_code"],
+                          "command_index": command_index, "finished_at": result["finished_at"]}
+            if hermes_output is not None:
+                ssh_result.update(hermes_output)
+            return {"ok": True, "ssh": ssh_result}
         if op == "decide":
             required = {"op", "request_id", "decision", "nonce", "canonical_hash", "user_id",
                         "guild_id", "channel_id", "message_id", "interaction_id"}
@@ -233,7 +478,12 @@ class Executor:
             if any(not isinstance(message[key], str) for key in required - {"op"}):
                 raise ProtocolError("invalid decision fields")
             row = self.store.get(message["request_id"])
-            self._revalidate(row)
+            try:
+                self._revalidate(row)
+            except (AccessError, StateError, ActionError, ConfigurationError) as exc:
+                if row["action"] == "access_grant" and row["status"] in ("pending", "posted"):
+                    self.store.invalidate_pending(row["id"], now, str(exc))
+                raise
             row = self.store.decide(message["request_id"], message["decision"], message["nonce"],
                                     message["canonical_hash"], message["user_id"], message["guild_id"],
                                     message["channel_id"], message["message_id"], message["interaction_id"],
@@ -277,6 +527,43 @@ class Executor:
     async def _execute(self, row: Any) -> Any:
         request_id = row["id"]
         now = self.clock()
+        if row["action"] == "access_grant":
+            try:
+                if self.store.emergency_state()["state"] != "inactive":
+                    raise StateError("emergency stop blocks SSH grants")
+                canonical = self._revalidate(row)
+                if canonical["audit_output"] == "full":
+                    self.store.check_restricted_sink()
+                expiry = int(self.clock() + canonical["ttl_seconds"])
+                assert self.access_action is not None
+                intent = {"pinned_ip": canonical["pinned_ips"][0], "expiry": expiry,
+                          "tag": self.access_action._identity(request_id, expiry),
+                          "broker_uid": self.access_action.uid}
+                self.store.mark_executing(request_id, intent, self.clock())
+                identity = await self._host_call(self.access_action.ensure_grant,
+                    canonical["pinned_ips"][0], request_id, expiry, self.clock())
+                if self.store.emergency_state()["state"] != "inactive":
+                    raise StateError("emergency stop interrupted SSH grant")
+                if identity["expiry"] != expiry:
+                    raise BrokerFirewallError("broker grant expiry changed")
+                if self.clock() >= expiry:
+                    raise ActionError("access grant expired before activation")
+                return self.store.mark_active(request_id, self.clock(), active_until=expiry)
+            except Exception as exc:
+                if not isinstance(exc, (ActionError, AccessError, BrokerFirewallError, StateError, OSError)):
+                    LOG.exception("unexpected access grant failure")
+                failure = str(exc) if isinstance(exc, (ActionError, AccessError, BrokerFirewallError,
+                                                      StateError, OSError)) else "internal access error"
+                if self.store.get(request_id)["status"] == "executing":
+                    try:
+                        assert self.access_action is not None
+                        rollback = json.loads(self.store.get(request_id)["rollback_json"])
+                        await self._host_call(self.access_action.revoke,
+                            rollback["pinned_ip"], request_id, rollback["expiry"])
+                    except Exception:
+                        self.store.rollback_error(request_id, "access rollback requires inspection", self.clock())
+                        return self.store.get(request_id)
+                return self.store.mark_failed(request_id, failure, self.clock())
         if row["action"] == "emergency_recover":
             started = False
             try:
@@ -382,21 +669,64 @@ class Executor:
         async with self.lock:
             now = self.clock()
             self.store.expire_pending(now)
+            if self.access_action is not None:
+                await self._host_call(self.access_action.ensure_guard)
+                for execution in self.store.interrupted_access_executions():
+                    if self.store.access_execution_state(execution["id"]) == "started":
+                        self.store.interrupt_access_execution(execution["id"], self.clock(),
+                            None, reason=("emergency_stop" if
+                                self.store.emergency_state()["state"] != "inactive"
+                                else "executor_restart"))
+                    else:
+                        self.store.fail_access_execution(execution["id"], self.clock(),
+                            "SSH command interrupted by executor restart")
+                    row = self.store.get(execution["request_id"])
+                    if row["status"] == "active":
+                        intent = json.loads(row["rollback_json"])
+                        await self._host_call(self.access_action.revoke,
+                            intent["pinned_ip"], row["id"], intent["expiry"])
+                        self.store.mark_rolled_back(row["id"], self.clock())
+                for row in self.store.failed_access_rows():
+                    intent = json.loads(row["rollback_json"])
+                    await self._host_call(self.access_action.revoke,
+                        intent["pinned_ip"], row["id"], intent["expiry"])
+                    self.store.mark_rolled_back(row["id"], self.clock())
+                for row in self.store.active_access_rows():
+                    if (row["active_until"] > now
+                            and self.store.emergency_state()["state"] == "inactive"):
+                        intent = json.loads(row["rollback_json"])
+                        await self._host_call(self.access_action.ensure_grant,
+                            intent["pinned_ip"], row["id"], intent["expiry"], now)
             emergency = self.store.emergency_state()
             emergency_restored = emergency["state"] == "inactive"
             if emergency["state"] != "inactive":
                 try:
-                    await self._host_call(self.emergency_action.enforce,
+                    await self._emergency_call(self.emergency_action.enforce,
                                             tuple(emergency["workload_units"]))
+                    for row in self.store.access_revoke_rows():
+                        row = self.store.begin_access_revoke(row["id"], self.clock(), "emergency-recovery")
+                        intent = json.loads(row["rollback_json"])
+                        assert self.access_action is not None
+                        await self._emergency_call(self.access_action.revoke,
+                            intent["pinned_ip"], row["id"], intent["expiry"])
+                        self.store.mark_revoked(row["id"], self.clock(), "emergency-recovery")
                     emergency_restored = True
                     if emergency["state"] != "active":
                         self.store.emergency_transition((emergency["state"],), "active",
                             "emergency_reconciled_to_stopped", self.clock())
-                except (ActionError, ConfigurationError, StateError) as exc:
+                except (ActionError, BrokerFirewallError, ConfigurationError, StateError) as exc:
                     self.store.emergency_event("emergency_reconcile_failed", self.clock(),
                         error=str(exc))
                     LOG.exception("emergency switch reconciliation failed")
             for row in self.store.recovery_rows(now):
+                if row["status"] == "revoking":
+                    intent = json.loads(row["rollback_json"])
+                    assert self.access_action is not None
+                    await self._host_call(self.access_action.revoke,
+                        intent["pinned_ip"], row["id"], intent["expiry"])
+                    self.store.mark_revoked(row["id"], self.clock(),
+                        intent.get("revoke_operator_id", "recovery"))
+                    continue
                 if row["status"] == "approved":
                     self.store.mark_failed(row["id"], "executor stopped before apply", self.clock())
                     continue
@@ -436,7 +766,12 @@ class Executor:
                 try:
                     canonical = json.loads(row["canonical_json"])
                     rollback = json.loads(row["rollback_json"])
-                    self.action.rollback(canonical, rollback)
+                    if row["action"] == "access_grant":
+                        assert self.access_action is not None
+                        await self._host_call(self.access_action.revoke,
+                            rollback["pinned_ip"], row["id"], rollback["expiry"])
+                    else:
+                        self.action.rollback(canonical, rollback)
                 except Exception as exc:
                     LOG.exception("rollback failed for %s", row["id"])
                     self.store.rollback_error(row["id"], str(exc), self.clock())
@@ -457,7 +792,8 @@ class Executor:
                 raise ProtocolError("unauthorized Unix peer")
             message = await read_message(reader)
             response = await self.dispatch(message, self.bot_uid)
-        except (ProtocolError, StateError, ConfigurationError, ActionError, ValueError) as exc:
+        except (ProtocolError, StateError, ConfigurationError, ActionError, AccessError,
+                BrokerFirewallError, ValueError) as exc:
             response = {"ok": False, "error": str(exc)}
         except Exception:
             LOG.exception("unexpected executor error")
@@ -489,13 +825,18 @@ async def serve(config: ExecutorConfig, policy: Policy) -> None:
     os.umask(0o077)
     for path in (config.state_path, config.audit_path, config.profiles_path):
         _secure_root_path(path)
+    if config.restricted_ssh_audit_path is not None:
+        if config.restricted_ssh_audit_path == config.audit_path:
+            raise RuntimeError("restricted SSH audit must use a separate file")
+        _secure_root_path(config.restricted_ssh_audit_path)
     _secure_root_path(config.bot_socket.parent, directory=True)
     if config.bot_socket.exists():
         old = config.bot_socket.lstat()
         if not stat.S_ISSOCK(old.st_mode) or old.st_uid != 0:
             raise RuntimeError("unsafe existing bot socket")
         config.bot_socket.unlink()
-    store = Store(config.state_path, config.audit_path, config.pending_ttl_seconds)
+    store = Store(config.state_path, config.audit_path, config.pending_ttl_seconds,
+                  config.restricted_ssh_audit_path)
     executor = Executor(config, policy, store)
     await executor.reconcile()
     server = await asyncio.start_unix_server(executor.connection, str(config.bot_socket),
@@ -506,7 +847,10 @@ async def serve(config: ExecutorConfig, policy: Policy) -> None:
     async def sweeper() -> None:
         while True:
             await asyncio.sleep(5)
-            await executor.reconcile()
+            try:
+                await executor.reconcile()
+            except Exception:
+                LOG.exception("periodic reconciliation failed")
 
     task = asyncio.create_task(sweeper())
     try:

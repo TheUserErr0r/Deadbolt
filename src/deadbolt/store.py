@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
 from pathlib import Path
 import secrets
 import sqlite3
+import stat
 import time
 import uuid
 from typing import Any
+
+from deadbolt.access import command_summary
+from deadbolt.ssh_exec import MAX_OUTPUT_BYTES, redact
 
 
 def canonical_json(value: object) -> str:
@@ -22,8 +27,12 @@ class StateError(ValueError):
 
 
 class Store:
-    def __init__(self, path: Path, audit_path: Path, pending_ttl_seconds: int = 600):
+    def __init__(self, path: Path, audit_path: Path, pending_ttl_seconds: int = 600,
+                 restricted_ssh_audit_path: Path | None = None):
         self.audit_path = audit_path
+        if restricted_ssh_audit_path == audit_path:
+            raise StateError("SSH output requires a separate restricted audit path")
+        self.restricted_ssh_audit_path = restricted_ssh_audit_path
         self.pending_ttl_seconds = pending_ttl_seconds
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
@@ -49,6 +58,16 @@ class Store:
             CREATE TABLE IF NOT EXISTS operator_audit_outbox (
                 id TEXT PRIMARY KEY, payload TEXT NOT NULL, flushed INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS restricted_ssh_outbox (
+                id TEXT PRIMARY KEY, payload TEXT NOT NULL, flushed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS access_executions (
+                id TEXT PRIMARY KEY, request_id TEXT NOT NULL, command_index INTEGER NOT NULL,
+                state TEXT NOT NULL, started_at REAL NOT NULL, finished_at REAL, result_json TEXT,
+                argv_json TEXT,
+                FOREIGN KEY (request_id) REFERENCES requests(id),
+                UNIQUE(request_id,command_index)
+            );
             CREATE TABLE IF NOT EXISTS emergency_switch (
                 id INTEGER PRIMARY KEY CHECK(id=1), state TEXT NOT NULL,
                 generation INTEGER NOT NULL, workload_units_json TEXT NOT NULL,
@@ -61,6 +80,8 @@ class Store:
             CREATE INDEX IF NOT EXISTS audit_unflushed ON audit_outbox(flushed);
             CREATE INDEX IF NOT EXISTS operator_audit_unflushed ON operator_audit_outbox(flushed);
         """)
+        if "argv_json" not in {row[1] for row in self.db.execute("PRAGMA table_info(access_executions)")}:
+            self.db.execute("ALTER TABLE access_executions ADD COLUMN argv_json TEXT")
 
     def close(self) -> None:
         self.db.close()
@@ -70,6 +91,16 @@ class Store:
                   "request_id": request_id, "event": event, **fields}
         self.db.execute("INSERT INTO audit_outbox(id,request_id,payload) VALUES(?,?,?)",
                         (record["event_id"], request_id, canonical_json(record)))
+
+    def _restricted_ssh_event(self, request_id: str, execution_id: str, event: str,
+                              now: float, **fields: object) -> None:
+        if self.restricted_ssh_audit_path is None:
+            raise StateError("restricted SSH audit sink is not configured")
+        record = {"event_id": str(uuid.uuid4()), "event": event,
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                  "request_id": request_id, "execution_id": execution_id, **fields}
+        self.db.execute("INSERT INTO restricted_ssh_outbox(id,payload) VALUES(?,?)",
+                        (record["event_id"], canonical_json(record)))
 
     def operator_event(self, event: str, now: float, operator_id: str,
                        interaction_id: str, result: dict[str, Any] | None = None,
@@ -183,6 +214,13 @@ class Store:
             self._event(request_id, "request_created", now, action=canonical["action"],
                         profile=canonical["profile"], ttl_seconds=canonical["ttl_seconds"],
                         requested_by_uid=requested_by_uid, requested_by_discord_id=requested_by_discord_id,
+                        destination=canonical.get("destination") if canonical["action"] == "access_grant" else None,
+                        pinned_ips=canonical.get("pinned_ips"), ports=canonical.get("ports"),
+                        protocol=canonical.get("protocol"), purpose=canonical.get("purpose"),
+                        first_command=(command_summary(canonical["initial_command"])
+                            if canonical.get("audit_output") == "full" else canonical.get("initial_command")),
+                        max_commands=canonical.get("max_commands"),
+                        audit_output=canonical.get("audit_output"),
                         operation=canonical.get("operation"), hostname=canonical.get("hostname"),
                         resulting_hosts=canonical.get("hosts"), canonical_hash=digest)
         return self.get(request_id)
@@ -205,6 +243,16 @@ class Store:
             self.db.execute("UPDATE requests SET status='posted',posted_message_id=? WHERE id=?",
                             (message_id, request_id))
             self._event(request_id, "approval_posted", now, discord_message_id=message_id)
+        return self.get(request_id)
+
+    def invalidate_pending(self, request_id: str, now: float, reason: str) -> sqlite3.Row:
+        with self.db:
+            row = self.get(request_id)
+            if row["status"] not in ("pending", "posted"):
+                raise StateError("request is no longer pending")
+            self.db.execute("UPDATE requests SET status='failed',last_error=? WHERE id=?",
+                            (reason[:200], request_id))
+            self._event(request_id, "request_invalidated", now, error=reason[:200])
         return self.get(request_id)
 
     def decide(self, request_id: str, decision: str, nonce: str, canonical_hash: str,
@@ -234,6 +282,11 @@ class Store:
             self._event(request_id, "approval_granted" if decision == "approve" else "approval_denied", now,
                         action=row["action"], profile=row["profile"],
                         approved_by_discord_id=user_id, canonical_hash=canonical_hash,
+                        destination=canonical.get("destination") if row["action"] == "access_grant" else None,
+                        pinned_ips=canonical.get("pinned_ips"), purpose=canonical.get("purpose"),
+                        first_command=(command_summary(canonical["initial_command"])
+                            if canonical.get("audit_output") == "full" else canonical.get("initial_command")),
+                        max_commands=canonical.get("max_commands"),
                         operation=canonical.get("operation"), hostname=canonical.get("hostname"),
                         resulting_hosts=canonical.get("hosts"))
         return self.get(request_id)
@@ -259,6 +312,11 @@ class Store:
             self.db.execute("UPDATE requests SET status='active',active_until=? WHERE id=?",
                             (expiry, request_id))
             fields = {"active_until": expiry, "approved_by_discord_id": row["approved_by_discord_id"]}
+            if row["action"] == "access_grant":
+                canonical = json.loads(row["canonical_json"])
+                fields.update(destination=canonical["destination"], pinned_ips=canonical["pinned_ips"],
+                              ports=canonical["ports"], protocol=canonical["protocol"],
+                              purpose=canonical["purpose"], rule_identity=json.loads(row["rollback_json"]))
             if helper_outcome is not None:
                 fields["helper_outcome"] = helper_outcome
             self._event(request_id, "grant_active", now, **fields)
@@ -303,6 +361,200 @@ class Store:
             self._event(request_id, "grant_rolled_back", now)
         return self.get(request_id)
 
+    def begin_access_revoke(self, request_id: str, now: float, operator_id: str) -> sqlite3.Row:
+        with self.db:
+            row = self.get(request_id)
+            if row["action"] != "access_grant" or row["status"] not in ("active", "revoking"):
+                raise StateError("access grant is not active")
+            if row["status"] == "active":
+                intent = json.loads(row["rollback_json"])
+                intent["revoke_operator_id"] = operator_id
+                self.db.execute("UPDATE requests SET status='revoking',rollback_json=? WHERE id=?",
+                                (canonical_json(intent), request_id))
+                self._event(request_id, "grant_revoke_started", now,
+                            revoked_by_discord_id=operator_id)
+        return self.get(request_id)
+
+    def mark_revoked(self, request_id: str, now: float, operator_id: str) -> sqlite3.Row:
+        with self.db:
+            row = self.get(request_id)
+            if row["status"] != "revoking" or row["action"] != "access_grant":
+                raise StateError("access grant is not revoking")
+            self.db.execute("UPDATE requests SET status='revoked' WHERE id=?", (request_id,))
+            self._event(request_id, "grant_revoked", now,
+                        approved_by_discord_id=row["approved_by_discord_id"],
+                        revoked_by_discord_id=operator_id)
+        return self.get(request_id)
+
+    def begin_access_execution(self, request_id: str, command: list[str], now: float) -> tuple[sqlite3.Row, str, int]:
+        with self.db:
+            row = self.get(request_id)
+            if (row["action"] != "access_grant" or row["status"] != "active"
+                    or row["active_until"] <= now):
+                raise StateError("approved SSH grant is absent or expired")
+            canonical = json.loads(row["canonical_json"])
+            if not canonical["audited_execution"] or not canonical["initial_command"]:
+                raise StateError("grant does not permit SSH execution")
+            count = self.db.execute("SELECT COUNT(*) FROM access_executions WHERE request_id=?",
+                                    (request_id,)).fetchone()[0]
+            if count >= canonical["max_commands"]:
+                raise StateError("approved SSH session command limit reached")
+            if count == 0 and command != canonical["initial_command"]:
+                raise StateError("first SSH command differs from approved argv")
+            running = self.db.execute("""SELECT 1 FROM access_executions
+                        WHERE request_id=? AND state='started'""", (request_id,)).fetchone()
+            if running:
+                raise StateError("another SSH command is in progress")
+            index = count + 1
+            execution_id = str(uuid.uuid4())
+            self.db.execute("""INSERT INTO access_executions
+                (id,request_id,command_index,state,started_at,argv_json) VALUES(?,?,?,?,?,?)""",
+                (execution_id, request_id, index, "started", now,
+                 canonical_json(command) if canonical["audit_output"] == "full" else None))
+            if canonical["audit_output"] == "full":
+                self._restricted_ssh_event(request_id, execution_id, "ssh_execution_started", now,
+                    approval_id=row["interaction_id"], command_index=index,
+                    destination=canonical["destination"], pinned_ip=canonical["pinned_ips"][0],
+                    ssh_user=canonical["ssh_user"], argv=command, started_at=now)
+            self._event(request_id, "ssh_execution_started", now,
+                        approved_by_discord_id=row["approved_by_discord_id"],
+                        destination=canonical["destination"], pinned_ips=canonical["pinned_ips"],
+                        ssh_user=canonical["ssh_user"], command_index=index,
+                        command=(command_summary(command) if canonical["audit_output"] == "full"
+                                 else [redact(part) for part in command]))
+        return row, execution_id, index
+
+    def finish_access_execution(self, execution_id: str, now: float, result: dict[str, Any]) -> None:
+        with self.db:
+            row = self.db.execute("SELECT request_id,state FROM access_executions WHERE id=?", (execution_id,)).fetchone()
+            if row is None or row["state"] != "started":
+                raise StateError("SSH execution is not in progress")
+            request = self.get(row["request_id"])
+            canonical = json.loads(request["canonical_json"])
+            if canonical["audit_output"] == "full":
+                self._restricted_ssh_event(row["request_id"], execution_id,
+                    "ssh_execution_completed", now, approval_id=request["interaction_id"],
+                    command_index=result["command_index"],
+                    destination=result["destination"], pinned_ip=result["pinned_ip"],
+                    ssh_user=result["ssh_user"], argv=result["command"],
+                    started_at=result["started_at"], finished_at=result["finished_at"],
+                    exit_code=result["exit_code"], termination=result["termination"],
+                    timed_out=result["timed_out"], stdout_b64=result["stdout_b64"],
+                    stderr_b64=result["stderr_b64"],
+                    stdout_truncated=result["stdout_truncated"],
+                    stderr_truncated=result["stderr_truncated"],
+                    output_encoding="base64")
+                self.db.execute("""UPDATE access_executions SET state='evidence_pending',
+                                   finished_at=?,result_json=? WHERE id=?""",
+                                (now, canonical_json({**{key: value for key, value in result.items()
+                                    if key not in ("command", "stdout_b64", "stderr_b64")},
+                                    "command_summary": command_summary(result["command"])}),
+                                 execution_id))
+                return
+            self.db.execute("""UPDATE access_executions SET state='finished',finished_at=?,result_json=?
+                               WHERE id=?""", (now, canonical_json(result), execution_id))
+            self._event(row["request_id"], "ssh_execution_finished", now,
+                        **{key: value for key, value in result.items()
+                           if key not in ("request_id", "stdout", "stderr", "stdout_b64", "stderr_b64")})
+
+    def finalize_access_execution(self, execution_id: str, now: float) -> None:
+        with self.db:
+            row = self.db.execute("SELECT request_id,state,result_json FROM access_executions WHERE id=?",
+                                  (execution_id,)).fetchone()
+            if row is None or row["state"] != "evidence_pending":
+                raise StateError("SSH evidence is not awaiting delivery")
+            result = json.loads(row["result_json"])
+            self.db.execute("UPDATE access_executions SET state='finished' WHERE id=?", (execution_id,))
+            self._event(row["request_id"], "ssh_execution_finished", now,
+                approved_by_discord_id=self.get(row["request_id"])["approved_by_discord_id"],
+                command_index=result["command_index"], destination=result["destination"],
+                pinned_ip=result["pinned_ip"], ssh_user=result["ssh_user"],
+                command=result["command_summary"], exit_code=result["exit_code"],
+                started_at=result["started_at"], finished_at=result["finished_at"],
+                termination=result["termination"], timed_out=result["timed_out"],
+                stdout_truncated=result["stdout_truncated"],
+                stderr_truncated=result["stderr_truncated"], audit_output="full")
+
+    def fail_access_execution(self, execution_id: str, now: float, error: str) -> None:
+        with self.db:
+            row = self.db.execute("SELECT request_id,state FROM access_executions WHERE id=?", (execution_id,)).fetchone()
+            if row is None or row["state"] not in ("started", "evidence_pending"):
+                raise StateError("SSH execution is not in progress")
+            self.db.execute("UPDATE access_executions SET state='failed',finished_at=? WHERE id=?",
+                            (now, execution_id))
+            self._event(row["request_id"], "ssh_execution_failed", now, error=error[:200])
+
+    def interrupt_access_execution(self, execution_id: str, now: float,
+                                   partial: dict[str, Any] | None,
+                                   reason: str = "emergency_stop") -> bool:
+        """Durably queue a full-evidence interruption before marking a command failed."""
+        if reason not in ("emergency_stop", "executor_restart"):
+            raise StateError("invalid SSH interruption reason")
+        partial = partial or {}
+        with self.db:
+            row = self.db.execute("SELECT * FROM access_executions WHERE id=?",
+                                  (execution_id,)).fetchone()
+            if row is None or row["state"] != "started":
+                return False
+            request = self.get(row["request_id"])
+            canonical = json.loads(request["canonical_json"])
+            if canonical["audit_output"] != "full":
+                self.fail_access_execution(execution_id, now, f"interrupted by {reason}")
+                return True
+            encoded = {}
+            for stream in ("stdout", "stderr"):
+                value = partial.get(stream + "_b64", "")
+                if not isinstance(value, str):
+                    raise StateError("invalid interrupted SSH output")
+                try:
+                    data = base64.b64decode(value, validate=True)
+                except (ValueError, base64.binascii.Error) as exc:
+                    raise StateError("invalid interrupted SSH output") from exc
+                if len(data) > MAX_OUTPUT_BYTES:
+                    raise StateError("interrupted SSH output exceeds policy")
+                encoded[stream + "_b64"] = value
+                flag = partial.get(stream + "_truncated", False)
+                if type(flag) is not bool:
+                    raise StateError("invalid interrupted SSH truncation state")
+                encoded[stream + "_truncated"] = flag
+            if row["argv_json"] is None:
+                raise StateError("SSH execution argv is unavailable for interruption evidence")
+            self._restricted_ssh_event(row["request_id"], execution_id,
+                "ssh_execution_interrupted", now, approval_id=request["interaction_id"],
+                command_index=row["command_index"], destination=canonical["destination"],
+                pinned_ip=canonical["pinned_ips"][0], ssh_user=canonical["ssh_user"],
+                argv=json.loads(row["argv_json"]), started_at=row["started_at"],
+                finished_at=now, reason=reason, output_incomplete=True,
+                output_encoding="base64", **encoded)
+            self.db.execute("UPDATE access_executions SET state='failed',finished_at=? WHERE id=?",
+                            (now, execution_id))
+            self._event(row["request_id"], "ssh_execution_failed", now,
+                        error=f"interrupted by {reason}", command_index=row["command_index"])
+        return True
+
+    def interrupted_access_executions(self) -> list[sqlite3.Row]:
+        return list(self.db.execute("""SELECT id,request_id,command_index FROM access_executions
+                                     WHERE state IN ('started','evidence_pending')"""))
+
+    def access_execution_state(self, execution_id: str) -> str:
+        row = self.db.execute("SELECT state FROM access_executions WHERE id=?", (execution_id,)).fetchone()
+        if row is None:
+            raise StateError("SSH execution is missing")
+        return row["state"]
+
+    def access_revoke_rows(self) -> list[sqlite3.Row]:
+        return list(self.db.execute("""SELECT * FROM requests WHERE action='access_grant'
+                                     AND status IN ('active','revoking') ORDER BY created_at"""))
+
+    def active_access_rows(self) -> list[sqlite3.Row]:
+        return list(self.db.execute("""SELECT * FROM requests WHERE action='access_grant'
+                                     AND status='active' ORDER BY created_at"""))
+
+    def failed_access_rows(self) -> list[sqlite3.Row]:
+        return list(self.db.execute("""SELECT r.* FROM requests r WHERE r.action='access_grant'
+            AND r.status='active' AND EXISTS (SELECT 1 FROM access_executions e
+                WHERE e.request_id=r.id AND e.state='failed') ORDER BY r.created_at"""))
+
     def expire_pending(self, now: float) -> int:
         rows = list(self.db.execute("SELECT id FROM requests WHERE status IN ('pending','posted') AND pending_until<=?", (now,)))
         with self.db:
@@ -312,8 +564,8 @@ class Store:
         return len(rows)
 
     def recovery_rows(self, now: float) -> list[sqlite3.Row]:
-        return list(self.db.execute("""SELECT * FROM requests WHERE status IN ('approved','executing')
-              OR (status='active' AND action='firewall_profile' AND active_until<=?) ORDER BY created_at""", (now,)))
+        return list(self.db.execute("""SELECT * FROM requests WHERE status IN ('approved','executing','revoking')
+              OR (status='active' AND action IN ('firewall_profile','access_grant') AND active_until<=?) ORDER BY created_at""", (now,)))
 
     def close_capture_grants(self, now: float, event: str, *, except_id: str | None = None) -> None:
         if event not in ("capture_superseded", "capture_observed_disabled"):
@@ -343,13 +595,24 @@ class Store:
         rows = list(self.db.execute("""SELECT rowid AS seq,id,payload,'request' AS kind FROM audit_outbox WHERE flushed=0
               UNION ALL SELECT rowid AS seq,id,payload,'operator' AS kind FROM operator_audit_outbox WHERE flushed=0
               ORDER BY kind DESC,seq"""))
+        restricted_count = self.flush_restricted_audit()
         if not rows:
-            return 0
+            return restricted_count
+        self._append_records(self.audit_path, rows)
+        with self.db:
+            self.db.executemany("UPDATE audit_outbox SET flushed=1 WHERE id=?",
+                                [(row["id"],) for row in rows if row["kind"] == "request"])
+            self.db.executemany("UPDATE operator_audit_outbox SET flushed=1 WHERE id=?",
+                                [(row["id"],) for row in rows if row["kind"] == "operator"])
+        return len(rows) + restricted_count
+
+    @staticmethod
+    def _append_records(path: Path, records: list[sqlite3.Row]) -> None:
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(self.audit_path, flags, 0o600)
+        fd = os.open(path, flags, 0o600)
         try:
-            for row in rows:
-                remaining = memoryview((row["payload"] + "\n").encode())
+            for item in records:
+                remaining = memoryview((item["payload"] + "\n").encode())
                 while remaining:
                     written = os.write(fd, remaining)
                     if written == 0:
@@ -358,9 +621,29 @@ class Store:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    def check_restricted_sink(self) -> None:
+        if self.restricted_ssh_audit_path is None:
+            raise StateError("restricted SSH audit sink is not configured")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.restricted_ssh_audit_path, flags, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077):
+                raise StateError("restricted SSH audit sink is not private")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def flush_restricted_audit(self) -> int:
+        restricted = list(self.db.execute("SELECT id,payload FROM restricted_ssh_outbox WHERE flushed=0"))
+        if not restricted:
+            return 0
+        self.check_restricted_sink()
+        assert self.restricted_ssh_audit_path is not None
+        self._append_records(self.restricted_ssh_audit_path, restricted)
         with self.db:
-            self.db.executemany("UPDATE audit_outbox SET flushed=1 WHERE id=?",
-                                [(row["id"],) for row in rows if row["kind"] == "request"])
-            self.db.executemany("UPDATE operator_audit_outbox SET flushed=1 WHERE id=?",
-                                [(row["id"],) for row in rows if row["kind"] == "operator"])
-        return len(rows)
+            self.db.executemany("UPDATE restricted_ssh_outbox SET flushed=1 WHERE id=?",
+                                [(row["id"],) for row in restricted])
+        return len(restricted)

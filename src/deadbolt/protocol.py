@@ -8,6 +8,8 @@ import socket
 import struct
 from typing import Any
 
+from deadbolt.access import MAX_COMMAND_SECONDS
+
 VERSION = 1
 MAX_MESSAGE_BYTES = 16_384
 INBOUND_MESSAGE_TIMEOUT_SECONDS = 5
@@ -15,6 +17,9 @@ DEFAULT_RESPONSE_TIMEOUT_SECONDS = 5
 # Covers two draining services plus fixed-policy verification while each host
 # command remains capped separately at 60 seconds.
 EMERGENCY_RESPONSE_TIMEOUT_SECONDS = 180
+# Bounds a root-configured foreground command (up to 15 minutes), plus exact
+# firewall verification and evidence delivery. Inbound request reads stay 5 sec.
+SSH_RESPONSE_TIMEOUT_SECONDS = MAX_COMMAND_SECONDS + 90
 
 
 class ProtocolError(ValueError):

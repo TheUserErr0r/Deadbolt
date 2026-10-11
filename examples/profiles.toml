@@ -1,6 +1,35 @@
 # Root-owned allow-list. Empty by default: no privileged action can be granted.
 [firewall_profiles]
 
+# Parameterized families are empty by default. Enabling one requires a full
+# root-owned boundary; a Hermes request supplies only destination, purpose,
+# TTL, and the first bounded argv command. Later commands share the approved
+# session but are checked and audited separately.
+[access_profiles]
+
+# [access_profiles.ssh-session]
+# direction = "out"
+# protocol = "tcp"
+# ports = [22]
+# max_ttl_seconds = 900
+# target_types = ["ip", "dns"]
+# allowed_cidrs = ["192.168.1.0/24"]
+# allow_public = false
+# operator_approval = true
+# audited_execution = true
+# ssh_user = "maintainer"
+# ssh_key = "/etc/deadbolt/keys/maintainer"
+# known_hosts = "/etc/deadbolt/known-hosts/managed"
+# remote_commands = ["uptime"]
+# max_commands = 20
+# max_command_seconds = 60
+# audit_output = "metadata"
+# To capture exact argv and bounded stdout/stderr in the separate restricted
+# evidence sink, set audit_output = "full" and configure its executor path.
+# A reviewed foreground installer may raise max_command_seconds up to 900;
+# this requires audit_output = "full" and a restricted sink. The approved
+# session TTL must be long enough to cover it.
+
 # Body capture remains disabled until the versioned root-owned helper and its
 # independent expiry timer are verified on the target host.
 [proxy_body_capture]
