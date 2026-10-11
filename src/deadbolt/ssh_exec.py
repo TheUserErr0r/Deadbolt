@@ -23,7 +23,9 @@ from deadbolt.access import AccessError, SENSITIVE, command_argv
 
 MAX_OUTPUT_BYTES = 65536  # Per stdout/stderr stream; excess is drained and flagged.
 MAX_ROOT_RESULT_BYTES = 262144
+MAX_PROGRESS_WIRE_BYTES = 16 * 1024 * 1024  # Includes bounded frame overhead.
 MAX_EXECUTION_SECONDS = 60
+BROKER_CANCELLATION_DRAIN_SECONDS = 2
 REMOTE_RECEIVER = "/usr/local/libexec/deadbolt-remote-exec"
 
 
@@ -48,7 +50,8 @@ def _safe_root_file(path: str, *, broker_uid: int, broker_gid: int, private: boo
 
 
 def _bounded_run(argv: list[str], payload: bytes, timeout: float,
-                 max_output_bytes: int = MAX_OUTPUT_BYTES) -> tuple[int, str, str]:
+                 max_output_bytes: int = MAX_OUTPUT_BYTES,
+                 on_stdout: Callable[[bytes], bytes] | None = None) -> tuple[int, str, str]:
     process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, shell=False, close_fds=True,
                                env={"PATH": "/usr/bin:/bin", "LANG": "C"})
@@ -56,6 +59,7 @@ def _bounded_run(argv: list[str], payload: bytes, timeout: float,
     deadline = time.monotonic() + timeout
     stdout_fd, stderr_fd = process.stdout.fileno(), process.stderr.fileno()
     output = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+    stdout_wire_bytes = 0
     data = memoryview(payload)
     selector = selectors.DefaultSelector()
     try:
@@ -84,6 +88,11 @@ def _bounded_run(argv: list[str], payload: bytes, timeout: float,
                         selector.unregister(key.fileobj)
                         key.fileobj.close()
                         continue
+                    if key.fd == stdout_fd and on_stdout is not None:
+                        stdout_wire_bytes += len(chunk)
+                        if stdout_wire_bytes > MAX_PROGRESS_WIRE_BYTES:
+                            raise AccessError("broker progress wire limit exceeded")
+                        chunk = on_stdout(chunk)
                     output[key.fd].extend(chunk)
                     if len(output[key.fd]) > max_output_bytes:
                         raise AccessError("SSH output limit exceeded")
@@ -113,7 +122,8 @@ class CaptureResult:
     timed_out: bool
 
 
-def _capture_run(argv: list[str], payload: bytes, timeout: float) -> CaptureResult:
+def _capture_run(argv: list[str], payload: bytes, timeout: float,
+                 on_chunk: Callable[[str, bytes, bool], None] | None = None) -> CaptureResult:
     """Capture exact bytes up to MAX_OUTPUT_BYTES per stream and keep draining."""
     process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, shell=False, close_fds=True,
@@ -128,9 +138,13 @@ def _capture_run(argv: list[str], payload: bytes, timeout: float) -> CaptureResu
     timed_out = False
     def append_chunk(fd: int, chunk: bytes) -> None:
         remaining_bytes = MAX_OUTPUT_BYTES - len(output[fd])
-        output[fd].extend(chunk[:remaining_bytes])
+        retained = chunk[:remaining_bytes]
+        output[fd].extend(retained)
+        newly_truncated = not truncated[fd] and len(chunk) > remaining_bytes
         if len(chunk) > remaining_bytes:
             truncated[fd] = True
+        if on_chunk is not None and (retained or newly_truncated):
+            on_chunk("stdout" if fd == stdout_fd else "stderr", retained, truncated[fd])
 
     try:
         for stream in (process.stdin, process.stdout, process.stderr):
@@ -202,7 +216,8 @@ def _ssh_argv(record: dict[str, Any]) -> list[str]:
 
 
 def run_child(record: dict[str, Any], runner: Callable[..., CaptureResult] = _capture_run,
-              now: Callable[[], float] = time.time) -> dict[str, Any]:
+              now: Callable[[], float] = time.time,
+              progress: Callable[[str, bytes, bool], None] | None = None) -> dict[str, Any]:
     required = {"version", "request_id", "approval_id", "command_index", "destination",
                 "pinned_ip", "ssh_user", "ssh_key", "known_hosts", "argv", "audit_output",
                 "expires_at", "timeout_seconds"}
@@ -226,8 +241,10 @@ def run_child(record: dict[str, Any], runner: Callable[..., CaptureResult] = _ca
         raise AccessError("expired or invalid broker command")
     started = now()
     payload = (json.dumps({"version": 1, "argv": command}, separators=(",", ":")) + "\n").encode()
-    captured = runner(_ssh_argv(record), payload,
-                      min(record["timeout_seconds"], record["expires_at"] - started))
+    deadline = min(record["timeout_seconds"], record["expires_at"] - started)
+    captured = (_capture_run(_ssh_argv(record), payload, deadline, progress)
+                if progress is not None and runner is _capture_run
+                else runner(_ssh_argv(record), payload, deadline))
     mode = record["audit_output"]
     termination = ("timeout" if captured.timed_out else "signal"
                    if captured.exit_code is not None and captured.exit_code < 0 else "exit")
@@ -254,6 +271,8 @@ class SystemdSSHExecutor:
         self.runner = runner
         self.owner_uid = owner_uid
         self._cancellations: dict[str, threading.Event] = {}
+        self._partial: dict[str, dict[str, Any]] = {}
+        self._done: dict[str, threading.Event] = {}
         self._cancellation_lock = threading.Lock()
 
     @staticmethod
@@ -266,12 +285,13 @@ class SystemdSSHExecutor:
             raise AccessError("invalid SSH unit identity")
         return f"deadbolt-ssh-{request_id}-{command_index}.service"
 
-    def cancel(self, request_id: str, command_index: int) -> None:
+    def cancel(self, request_id: str, command_index: int) -> dict[str, Any]:
         """Preempt a known transient unit; safe before the worker starts it."""
         unit = self._unit(request_id, command_index)
         with self._cancellation_lock:
             event = self._cancellations.setdefault(unit, threading.Event())
             event.set()
+            done = self._done.get(unit)
         try:
             subprocess.run(["/usr/bin/systemctl", "stop", unit], shell=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -284,6 +304,16 @@ class SystemdSSHExecutor:
             raise AccessError("SSH unit cancellation failed") from exc
         if state.returncode or state.stdout.strip() not in ("inactive", "failed"):
             raise AccessError("SSH unit remained active after cancellation")
+        if done is not None:
+            done.wait(BROKER_CANCELLATION_DRAIN_SECONDS)
+        with self._cancellation_lock:
+            partial = self._partial.pop(unit, None) or {
+                "stdout": bytearray(), "stderr": bytearray(),
+                "stdout_truncated": False, "stderr_truncated": False}
+        return {"stdout_b64": base64.b64encode(partial["stdout"]).decode("ascii"),
+                "stderr_b64": base64.b64encode(partial["stderr"]).decode("ascii"),
+                "stdout_truncated": partial["stdout_truncated"],
+                "stderr_truncated": partial["stderr_truncated"]}
 
     def execute(self, canonical: dict[str, Any], request_id: str, approval_id: str,
                 command_index: int, argv: list[str], active_until: float,
@@ -328,8 +358,15 @@ class SystemdSSHExecutor:
         unit = self._unit(request_id, command_index)
         with self._cancellation_lock:
             cancelled = self._cancellations.setdefault(unit, threading.Event())
+            self._done[unit] = threading.Event()
+            self._partial[unit] = {"stdout": bytearray(), "stderr": bytearray(),
+                                   "stdout_truncated": False, "stderr_truncated": False}
         if cancelled.is_set():
             path.unlink(missing_ok=True)
+            with self._cancellation_lock:
+                self._done.pop(unit, None)
+                self._partial.pop(unit, None)
+                self._cancellations.pop(unit, None)
             raise AccessError("SSH command was cancelled")
         address = canonical["pinned_ips"][0]
         prefix = "128" if ":" in address else "32"
@@ -346,21 +383,63 @@ class SystemdSSHExecutor:
         command_line = ["/usr/bin/systemd-run", "--quiet", "--wait", "--pipe", "--collect",
                         f"--unit={unit}", *(f"--property={item}" for item in properties),
                         "/opt/deadbolt/venv/bin/deadbolt-ssh-child"]
+        frame_buffer = bytearray()
+        def receive(chunk: bytes) -> bytes:
+            frame_buffer.extend(chunk)
+            if len(frame_buffer) > MAX_ROOT_RESULT_BYTES:
+                raise AccessError("broker progress frame is oversized")
+            result_lines = bytearray()
+            while b"\n" in frame_buffer:
+                line, _, remaining = frame_buffer.partition(b"\n")
+                frame_buffer[:] = remaining
+                if not line.startswith(b'{"type":"progress",'):
+                    result_lines.extend(line + b"\n")
+                    continue
+                try:
+                    frame = json.loads(line)
+                    if (set(frame) != {"type", "stream", "data_b64", "truncated"}
+                            or frame["stream"] not in ("stdout", "stderr")
+                            or type(frame["truncated"]) is not bool):
+                        raise ValueError("invalid progress frame")
+                    data = base64.b64decode(frame["data_b64"], validate=True)
+                except (ValueError, TypeError, base64.binascii.Error) as exc:
+                    raise AccessError("invalid broker progress frame") from exc
+                with self._cancellation_lock:
+                    partial = self._partial.get(unit)
+                    if partial is None:
+                        continue
+                    stream = partial[frame["stream"]]
+                    if len(stream) + len(data) > MAX_OUTPUT_BYTES:
+                        raise AccessError("broker progress exceeds output limit")
+                    stream.extend(data)
+                    partial[frame["stream"] + "_truncated"] |= frame["truncated"]
+            return bytes(result_lines)
         try:
             if cancelled.is_set():
                 raise AccessError("SSH command was cancelled")
-            status, stdout, _stderr = self.runner(command_line, b"", limit + 10,
-                                                   MAX_ROOT_RESULT_BYTES)
+            if self.runner is _bounded_run and canonical["audit_output"] == "full":
+                status, stdout, _stderr = self.runner(command_line, b"", limit + 10,
+                                                       MAX_ROOT_RESULT_BYTES, receive)
+            else:
+                status, stdout, _stderr = self.runner(command_line, b"", limit + 10,
+                                                       MAX_ROOT_RESULT_BYTES)
         finally:
             path.unlink(missing_ok=True)
             with self._cancellation_lock:
+                self._done[unit].set()
+                self._done.pop(unit, None)
                 self._cancellations.pop(unit, None)
+                if not cancelled.is_set():
+                    self._partial.pop(unit, None)
         if cancelled.is_set():
             raise AccessError("SSH command was cancelled")
-        if status != 0 or stdout.count("\n") != 1 or len(stdout) > MAX_ROOT_RESULT_BYTES:
+        lines = stdout.splitlines()
+        if (status != 0 or not lines or len(stdout) > MAX_ROOT_RESULT_BYTES
+                or (canonical["audit_output"] == "metadata" and len(lines) != 1)
+                or any(not line.startswith('{"type":"progress",') for line in lines[:-1])):
             raise AccessError("broker unit failed or returned invalid result")
         try:
-            result = json.loads(stdout)
+            result = json.loads(lines[-1])
         except ValueError as exc:
             raise AccessError("invalid broker unit result") from exc
         if (not isinstance(result, dict) or set(result) != {"request_id", "approval_id", "command_index",
@@ -410,7 +489,13 @@ def child_main() -> None:
             raw = stream.read(3073)
         if len(raw) > 3072:
             raise AccessError("oversized broker credential")
-        result = run_child(json.loads(raw))
+        record = json.loads(raw)
+        def progress(stream: str, chunk: bytes, truncated: bool) -> None:
+            sys.stdout.write(json.dumps({"type": "progress", "stream": stream,
+                "data_b64": base64.b64encode(chunk).decode("ascii"),
+                "truncated": truncated}, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+        result = run_child(record, progress=progress if record.get("audit_output") == "full" else None)
         sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
     except (AccessError, OSError, ValueError, KeyError):
         sys.stderr.write("broker child failed\n")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 import subprocess
@@ -207,10 +208,14 @@ class EmergencyTests(unittest.TestCase):
             def cancel(self, request_id, command_index):
                 self.cancelled = True
                 self.released.set()
+                return {"stdout_b64": base64.b64encode(b"partial token=stdout-secret").decode(),
+                        "stderr_b64": base64.b64encode(b"partial password=stderr-secret").decode(),
+                        "stdout_truncated": False, "stderr_truncated": False}
 
         firewall, ssh = FakeFirewall(), HungSSH()
         self.policy = Policy({}, False, (), ("hermes-worker.service",),
-                             {"ssh-session": profile()})
+                             {"ssh-session": profile(audit_output="full")})
+        self.store.restricted_ssh_audit_path = self.base / "ssh-evidence.jsonl"
         self.executor.policy = self.policy
         self.executor.access_action = firewall
         self.executor.ssh_executor = ssh
@@ -229,7 +234,7 @@ class EmergencyTests(unittest.TestCase):
                     created = (await relay.root({"op": "create", "action": "access_grant",
                         "profile": "ssh-session", "destination": "192.168.1.4",
                         "purpose": "maintenance", "reason": "maintenance", "ttl_seconds": 300,
-                        "command": ["uptime"], "requested_by_uid": 102}))["request"]
+                        "command": ["uptime", "token=command-secret"], "requested_by_uid": 102}))["request"]
                     await relay.root({"op": "posted", "request_id": created["id"], "message_id": "44"})
                     posted = (await relay.root({"op": "list", "state": "posted", "offset": 0}))["requests"][0]
                     approved = (await relay.root({"op": "decide", "request_id": posted["id"],
@@ -241,7 +246,7 @@ class EmergencyTests(unittest.TestCase):
                     self.assertIn(created["id"], firewall.active)
                     command = asyncio.create_task(relay.root({"op": "access_execute",
                         "request_id": created["id"], "requested_by_uid": 102,
-                        "destination": "192.168.1.4", "argv": ["uptime"]}, ssh_response=True))
+                        "destination": "192.168.1.4", "argv": ["uptime", "token=command-secret"]}, ssh_response=True))
                     self.assertTrue(await asyncio.to_thread(ssh.started.wait, 2))
                     started = time.monotonic()
                     result = await asyncio.wait_for(relay.emergency_operator(
@@ -256,6 +261,24 @@ class EmergencyTests(unittest.TestCase):
                     self.assertEqual(self.store.get(created["id"])["status"], "revoked")
                     with self.assertRaises(ProtocolError):
                         await asyncio.wait_for(command, timeout=3)
+                    evidence = [json.loads(line) for line in
+                        self.store.restricted_ssh_audit_path.read_text().splitlines()]
+                    self.assertEqual([entry["event"] for entry in evidence],
+                                     ["ssh_execution_started", "ssh_execution_interrupted"])
+                    interrupted = evidence[-1]
+                    self.assertEqual(interrupted["request_id"], created["id"])
+                    self.assertEqual(interrupted["execution_id"], evidence[0]["execution_id"])
+                    self.assertEqual(interrupted["argv"], ["uptime", "token=command-secret"])
+                    self.assertEqual(interrupted["reason"], "emergency_stop")
+                    self.assertTrue(interrupted["output_incomplete"])
+                    self.assertEqual(base64.b64decode(interrupted["stdout_b64"]),
+                                     b"partial token=stdout-secret")
+                    self.assertEqual(base64.b64decode(interrupted["stderr_b64"]),
+                                     b"partial password=stderr-secret")
+                    normal = (self.base / "audit.jsonl").read_text()
+                    self.assertNotIn("command-secret", normal)
+                    self.assertNotIn("stdout-secret", normal)
+                    self.assertNotIn("stderr-secret", normal)
                     self.assertTrue(self.host.units["deadbolt-bot.service"])
                     self.assertTrue(self.host.units["alloy.service"])
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -478,8 +479,71 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(result.stdout, b"before-timeout")
         self.assertEqual(result.stderr, b"")
 
+    def test_full_capture_reports_bounded_progress_before_command_exits(self):
+        seen = []
+        script = ("import sys,time; "
+                  "sys.stdout.buffer.write(b'token=partial'); sys.stdout.flush(); "
+                  "sys.stderr.buffer.write(b'password=partial'); sys.stderr.flush(); "
+                  "time.sleep(0.3)")
+        result = _capture_run([sys.executable, "-c", script], b"", 2,
+            lambda stream, data, truncated: seen.append((stream, data, truncated)))
+        self.assertEqual(result.stdout, b"token=partial")
+        self.assertEqual(result.stderr, b"password=partial")
+        self.assertIn(("stdout", b"token=partial", False), seen)
+        self.assertIn(("stderr", b"password=partial", False), seen)
+
 
 class SSHUnitTests(unittest.TestCase):
+    def test_cancel_preserves_progress_received_from_full_evidence_child(self):
+        rid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        canonical = canonical_access(profile(audit_output="full"), "192.168.1.4",
+                                     "maintenance", 300, ["uptime", "token=secret"])
+        ready, release = threading.Event(), threading.Event()
+        failure = []
+
+        def runner(argv, payload, timeout, maximum, on_stdout):
+            for stream, data in (("stdout", b"token=partial"),
+                                 ("stderr", b"password=partial")):
+                frame = {"type": "progress", "stream": stream,
+                         "data_b64": base64.b64encode(data).decode(), "truncated": False}
+                on_stdout((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+            ready.set()
+            self.assertTrue(release.wait(3))
+            return 1, "", ""
+
+        def systemctl(argv, **kwargs):
+            if argv[1] == "stop":
+                release.set()
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return subprocess.CompletedProcess(argv, 0, "inactive\n", "")
+
+        with tempfile.TemporaryDirectory() as path:
+            with patch("deadbolt.ssh_exec.pwd.getpwnam",
+                       return_value=type("A", (), {"pw_uid": 104, "pw_gid": 104})()), \
+                 patch("deadbolt.ssh_exec._safe_root_file"), \
+                 patch("deadbolt.ssh_exec._bounded_run", runner), \
+                 patch("deadbolt.ssh_exec.subprocess.run", side_effect=systemctl):
+                unit = SystemdSSHExecutor(Path(path), runner=runner,
+                                          owner_uid=Path(path).stat().st_uid)
+                worker = threading.Thread(target=lambda: self._execute_cancelled(unit,
+                    canonical, rid, failure))
+                worker.start()
+                self.assertTrue(ready.wait(3))
+                partial = unit.cancel(rid, 1)
+                worker.join(3)
+                self.assertFalse(worker.is_alive())
+        self.assertEqual(base64.b64decode(partial["stdout_b64"]), b"token=partial")
+        self.assertEqual(base64.b64decode(partial["stderr_b64"]), b"password=partial")
+        self.assertEqual(len(failure), 1)
+        self.assertIsInstance(failure[0], AccessError)
+
+    @staticmethod
+    def _execute_cancelled(unit, canonical, rid, failure):
+        try:
+            unit.execute(canonical, rid, "55", 1, ["uptime", "token=secret"], 1300, 1000)
+        except Exception as exc:
+            failure.append(exc)
+
     def test_child_full_mode_preserves_exact_command_and_binary_streams(self):
         record = {"version": 1, "request_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "approval_id": "55", "command_index": 1, "destination": "host.example",

@@ -181,14 +181,21 @@ class Executor:
                     previously_active=previous)
             failures: list[str] = []
             for execution in self.store.interrupted_access_executions():
+                partial = None
                 try:
-                    await self._emergency_call(self.ssh_executor.cancel,
+                    partial = await self._emergency_call(self.ssh_executor.cancel,
                         execution["request_id"], execution["command_index"])
                 except Exception:
                     failures.append("SSH unit cancellation failed")
                 if self.store.access_execution_state(execution["id"]) == "started":
-                    self.store.fail_access_execution(execution["id"], self.clock(),
-                        "interrupted by emergency stop")
+                    try:
+                        self.store.interrupt_access_execution(execution["id"], self.clock(), partial)
+                    except Exception:
+                        failures.append("SSH interruption evidence could not be queued")
+            try:
+                self.store.flush_restricted_audit()
+            except Exception:
+                failures.append("SSH interruption evidence delivery failed")
             for row in self.store.access_revoke_rows():
                 try:
                     row = self.store.begin_access_revoke(row["id"], self.clock(), message["user_id"])
@@ -640,8 +647,14 @@ class Executor:
             if self.access_action is not None:
                 await self._host_call(self.access_action.ensure_guard)
                 for execution in self.store.interrupted_access_executions():
-                    self.store.fail_access_execution(execution["id"], self.clock(),
-                        "SSH command interrupted by executor restart")
+                    if self.store.access_execution_state(execution["id"]) == "started":
+                        self.store.interrupt_access_execution(execution["id"], self.clock(),
+                            None, reason=("emergency_stop" if
+                                self.store.emergency_state()["state"] != "inactive"
+                                else "executor_restart"))
+                    else:
+                        self.store.fail_access_execution(execution["id"], self.clock(),
+                            "SSH command interrupted by executor restart")
                     row = self.store.get(execution["request_id"])
                     if row["status"] == "active":
                         intent = json.loads(row["rollback_json"])

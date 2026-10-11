@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ import uuid
 from typing import Any
 
 from deadbolt.access import command_summary
-from deadbolt.ssh_exec import redact
+from deadbolt.ssh_exec import MAX_OUTPUT_BYTES, redact
 
 
 def canonical_json(value: object) -> str:
@@ -63,6 +64,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS access_executions (
                 id TEXT PRIMARY KEY, request_id TEXT NOT NULL, command_index INTEGER NOT NULL,
                 state TEXT NOT NULL, started_at REAL NOT NULL, finished_at REAL, result_json TEXT,
+                argv_json TEXT,
                 FOREIGN KEY (request_id) REFERENCES requests(id),
                 UNIQUE(request_id,command_index)
             );
@@ -78,6 +80,8 @@ class Store:
             CREATE INDEX IF NOT EXISTS audit_unflushed ON audit_outbox(flushed);
             CREATE INDEX IF NOT EXISTS operator_audit_unflushed ON operator_audit_outbox(flushed);
         """)
+        if "argv_json" not in {row[1] for row in self.db.execute("PRAGMA table_info(access_executions)")}:
+            self.db.execute("ALTER TABLE access_executions ADD COLUMN argv_json TEXT")
 
     def close(self) -> None:
         self.db.close()
@@ -404,8 +408,9 @@ class Store:
             index = count + 1
             execution_id = str(uuid.uuid4())
             self.db.execute("""INSERT INTO access_executions
-                (id,request_id,command_index,state,started_at) VALUES(?,?,?,?,?)""",
-                (execution_id, request_id, index, "started", now))
+                (id,request_id,command_index,state,started_at,argv_json) VALUES(?,?,?,?,?,?)""",
+                (execution_id, request_id, index, "started", now,
+                 canonical_json(command) if canonical["audit_output"] == "full" else None))
             if canonical["audit_output"] == "full":
                 self._restricted_ssh_event(request_id, execution_id, "ssh_execution_started", now,
                     approval_id=row["interaction_id"], command_index=index,
@@ -478,6 +483,54 @@ class Store:
             self.db.execute("UPDATE access_executions SET state='failed',finished_at=? WHERE id=?",
                             (now, execution_id))
             self._event(row["request_id"], "ssh_execution_failed", now, error=error[:200])
+
+    def interrupt_access_execution(self, execution_id: str, now: float,
+                                   partial: dict[str, Any] | None,
+                                   reason: str = "emergency_stop") -> bool:
+        """Durably queue a full-evidence interruption before marking a command failed."""
+        if reason not in ("emergency_stop", "executor_restart"):
+            raise StateError("invalid SSH interruption reason")
+        partial = partial or {}
+        with self.db:
+            row = self.db.execute("SELECT * FROM access_executions WHERE id=?",
+                                  (execution_id,)).fetchone()
+            if row is None or row["state"] != "started":
+                return False
+            request = self.get(row["request_id"])
+            canonical = json.loads(request["canonical_json"])
+            if canonical["audit_output"] != "full":
+                self.fail_access_execution(execution_id, now, f"interrupted by {reason}")
+                return True
+            encoded = {}
+            for stream in ("stdout", "stderr"):
+                value = partial.get(stream + "_b64", "")
+                if not isinstance(value, str):
+                    raise StateError("invalid interrupted SSH output")
+                try:
+                    data = base64.b64decode(value, validate=True)
+                except (ValueError, base64.binascii.Error) as exc:
+                    raise StateError("invalid interrupted SSH output") from exc
+                if len(data) > MAX_OUTPUT_BYTES:
+                    raise StateError("interrupted SSH output exceeds policy")
+                encoded[stream + "_b64"] = value
+                flag = partial.get(stream + "_truncated", False)
+                if type(flag) is not bool:
+                    raise StateError("invalid interrupted SSH truncation state")
+                encoded[stream + "_truncated"] = flag
+            if row["argv_json"] is None:
+                raise StateError("SSH execution argv is unavailable for interruption evidence")
+            self._restricted_ssh_event(row["request_id"], execution_id,
+                "ssh_execution_interrupted", now, approval_id=request["interaction_id"],
+                command_index=row["command_index"], destination=canonical["destination"],
+                pinned_ip=canonical["pinned_ips"][0], ssh_user=canonical["ssh_user"],
+                argv=json.loads(row["argv_json"]), started_at=row["started_at"],
+                finished_at=now, reason=reason, output_incomplete=True,
+                output_encoding="base64", **encoded)
+            self.db.execute("UPDATE access_executions SET state='failed',finished_at=? WHERE id=?",
+                            (now, execution_id))
+            self._event(row["request_id"], "ssh_execution_failed", now,
+                        error=f"interrupted by {reason}", command_index=row["command_index"])
+        return True
 
     def interrupted_access_executions(self) -> list[sqlite3.Row]:
         return list(self.db.execute("""SELECT id,request_id,command_index FROM access_executions

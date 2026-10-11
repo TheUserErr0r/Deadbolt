@@ -124,6 +124,15 @@ redaction. Each decoded stream is capped at **65,536 bytes**; a corresponding
 `stdout_truncated` or `stderr_truncated` boolean is true if more bytes were
 produced. Excess bytes are drained and discarded. Truncation is never silent.
 The restricted SQLite outbox also contains these records until delivery.
+If emergency stop cancels a running command, the restricted stream instead
+receives `ssh_execution_interrupted` with the exact argv, request/approval/
+execution IDs, command index, target, timestamps, `reason="emergency_stop"`,
+and `output_incomplete=true`. The broker child streams bounded progress to the
+root executor while it runs. The interruption record includes any stdout and
+stderr bytes received before cancellation as separate base64 fields, with
+explicit truncation flags. Bytes still buffered in the remote process or
+transport at termination may be unavailable; `output_incomplete` makes that
+limit explicit. The ordinary audit stream receives only interruption metadata.
 The root-owned state database also holds the initial canonical argv for
 approval binding. Treat the database, outbox, and restricted file as sensitive
 evidence; none is an input to the ordinary Argus relay.
