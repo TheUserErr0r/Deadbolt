@@ -19,7 +19,8 @@ from deadbolt.actions import ActionError, UfwAction
 from deadbolt.bot import BotConfig, Relay, handle_approval_button
 from deadbolt.config import ConfigurationError, ExecutorConfig, FirewallProfile, Policy, resolve_action
 from deadbolt.executor import Executor
-from deadbolt.protocol import ProtocolError, decode_message, peer_uid, require_fields
+from deadbolt.protocol import (INBOUND_MESSAGE_TIMEOUT_SECONDS, ProtocolError,
+                               decode_message, peer_uid, read_message, require_fields)
 from deadbolt.store import StateError, Store
 
 
@@ -92,6 +93,17 @@ class ProtocolTests(unittest.TestCase):
     def test_linux_peer_credentials(self) -> None:
         fake = SimpleNamespace(getsockopt=lambda level, option, size: struct.pack("3i", 123, 456, 789))
         self.assertEqual(peer_uid(fake), 456)
+
+    def test_inbound_message_read_still_uses_five_second_deadline(self) -> None:
+        self.assertEqual(INBOUND_MESSAGE_TIMEOUT_SECONDS, 5)
+        async def receive() -> None:
+            await read_message(asyncio.StreamReader())
+
+        with patch("deadbolt.protocol.asyncio.wait_for", side_effect=asyncio.TimeoutError) as wait:
+            with self.assertRaisesRegex(ProtocolError, "message read failed"):
+                asyncio.run(receive())
+            self.assertEqual(wait.call_args.kwargs["timeout"], 5)
+            wait.call_args.args[0].close()
 
 
 class DiscordButtonTests(unittest.IsolatedAsyncioTestCase):
@@ -256,6 +268,7 @@ class ExecutorTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.patch.stop()
+        self.executor.close()
         self.store.close()
         self.temp.cleanup()
 

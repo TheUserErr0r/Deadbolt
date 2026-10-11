@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import hashlib
 import json
 import logging
@@ -22,6 +24,7 @@ from deadbolt.protocol import MAX_MESSAGE_BYTES, ProtocolError, peer_uid, read_m
 from deadbolt.store import StateError, Store, canonical_json
 
 LOG = logging.getLogger(__name__)
+HOST_WORKER_WAKE_SECONDS = 0.25
 
 
 class Executor:
@@ -45,6 +48,21 @@ class Executor:
         self.bot_gid = bot_account.pw_gid
         self.hermes_uid = pwd.getpwnam(config.hermes_user).pw_uid
         self.emergency_action = emergency_action or EmergencyAction(self.hermes_uid)
+        self.host_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deadbolt-host")
+
+    async def _host_call(self, func: Callable[..., Any], *args: Any) -> Any:
+        future = asyncio.get_running_loop().run_in_executor(self.host_pool, partial(func, *args))
+        # A timed wait keeps the event loop responsive even when a worker
+        # completion notification is delayed. Shielding leaves the host
+        # operation running until its own fixed subprocess deadline.
+        while True:
+            try:
+                return await asyncio.wait_for(asyncio.shield(future), timeout=HOST_WORKER_WAKE_SECONDS)
+            except asyncio.TimeoutError:
+                continue
+
+    def close(self) -> None:
+        self.host_pool.shutdown(wait=False, cancel_futures=True)
 
     def _revalidate(self, row: Any) -> dict[str, Any]:
         original = json.loads(row["canonical_json"])
@@ -139,9 +157,10 @@ class Executor:
             self._operator(message)
             if op == "emergency_status":
                 try:
-                    enforced = self.emergency_action.enabled()
+                    enforced = await self._host_call(self.emergency_action.enabled)
                     state = self.store.emergency_state()
-                    running = self.emergency_action.active_units(tuple(state["workload_units"]))
+                    running = await self._host_call(self.emergency_action.active_units,
+                                                       tuple(state["workload_units"]))
                 except ActionError as exc:
                     self.store.emergency_event("emergency_status_failed", now,
                         operator_id=message["user_id"], interaction_id=message["interaction_id"],
@@ -156,7 +175,7 @@ class Executor:
                 if state["state"] == "inactive":
                     units = self.policy_loader().emergency_workload_units
                     try:
-                        previous = self.emergency_action.active_units(units)
+                        previous = await self._host_call(self.emergency_action.active_units, units)
                     except ActionError as exc:
                         self.store.emergency_event("emergency_stop_failed", now,
                             operator_id=message["user_id"], interaction_id=message["interaction_id"],
@@ -167,7 +186,8 @@ class Executor:
                         interaction_id=message["interaction_id"], workload_units=units,
                         previously_active=previous, next_generation=True)
                 try:
-                    self.emergency_action.enforce(tuple(state["workload_units"]))
+                    await self._host_call(self.emergency_action.enforce,
+                                            tuple(state["workload_units"]))
                 except ActionError as exc:
                     self.store.emergency_event("emergency_stop_failed", self.clock(),
                         operator_id=message["user_id"], interaction_id=message["interaction_id"],
@@ -266,8 +286,8 @@ class Executor:
                 self.store.emergency_transition(("active",), "recovering",
                     "emergency_recovery_started", now,
                     operator_id=row["approved_by_discord_id"], request_id=request_id)
-                self.emergency_action.recover(tuple(canonical["previously_active"]),
-                                              tuple(canonical["workload_units"]))
+                await self._host_call(self.emergency_action.recover,
+                    tuple(canonical["previously_active"]), tuple(canonical["workload_units"]))
                 self.store.emergency_transition(("recovering",), "inactive",
                     "emergency_recovered", self.clock(),
                     operator_id=row["approved_by_discord_id"], request_id=request_id,
@@ -281,7 +301,8 @@ class Executor:
                 rollback_error = None
                 if started:
                     try:
-                        self.emergency_action.enforce(tuple(json.loads(row["canonical_json"])["workload_units"]))
+                        await self._host_call(self.emergency_action.enforce,
+                            tuple(json.loads(row["canonical_json"])["workload_units"]))
                     except Exception as rollback_exc:
                         rollback_error = str(rollback_exc) if isinstance(rollback_exc, ActionError) else "internal emergency reblock error"
                 self.store.emergency_event("emergency_recovery_failed", self.clock(),
@@ -365,7 +386,8 @@ class Executor:
             emergency_restored = emergency["state"] == "inactive"
             if emergency["state"] != "inactive":
                 try:
-                    self.emergency_action.enforce(tuple(emergency["workload_units"]))
+                    await self._host_call(self.emergency_action.enforce,
+                                            tuple(emergency["workload_units"]))
                     emergency_restored = True
                     if emergency["state"] != "active":
                         self.store.emergency_transition((emergency["state"],), "active",
@@ -492,6 +514,7 @@ async def serve(config: ExecutorConfig, policy: Policy) -> None:
             await server.serve_forever()
     finally:
         task.cancel()
+        executor.close()
         store.close()
         config.bot_socket.unlink(missing_ok=True)
 

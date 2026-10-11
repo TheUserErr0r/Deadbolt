@@ -10,6 +10,11 @@ from typing import Any
 
 VERSION = 1
 MAX_MESSAGE_BYTES = 16_384
+INBOUND_MESSAGE_TIMEOUT_SECONDS = 5
+DEFAULT_RESPONSE_TIMEOUT_SECONDS = 5
+# Covers two draining services plus fixed-policy verification while each host
+# command remains capped separately at 60 seconds.
+EMERGENCY_RESPONSE_TIMEOUT_SECONDS = 180
 
 
 class ProtocolError(ValueError):
@@ -41,9 +46,9 @@ def require_fields(message: dict[str, Any], required: set[str], optional: set[st
         raise ProtocolError("unexpected or missing fields")
 
 
-async def read_message(reader: asyncio.StreamReader) -> dict[str, Any]:
+async def read_message(reader: asyncio.StreamReader, *, timeout_seconds: int = INBOUND_MESSAGE_TIMEOUT_SECONDS) -> dict[str, Any]:
     try:
-        raw = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=5)
+        raw = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=timeout_seconds)
     except (asyncio.TimeoutError, asyncio.LimitOverrunError, asyncio.IncompleteReadError) as exc:
         raise ProtocolError("message read failed") from exc
     return decode_message(raw)
@@ -65,11 +70,12 @@ def peer_uid(sock: socket.socket) -> int:
     return uid
 
 
-async def rpc(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def rpc(path: str, payload: dict[str, Any], *,
+              response_timeout_seconds: int = DEFAULT_RESPONSE_TIMEOUT_SECONDS) -> dict[str, Any]:
     reader, writer = await asyncio.open_unix_connection(path, limit=MAX_MESSAGE_BYTES + 1)
     try:
         await write_message(writer, payload)
-        return await read_message(reader)
+        return await read_message(reader, timeout_seconds=response_timeout_seconds)
     finally:
         writer.close()
         await writer.wait_closed()
