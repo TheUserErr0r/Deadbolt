@@ -3,6 +3,9 @@
 [executor]
 state_path = "/var/lib/deadbolt/state.db"
 audit_path = "/var/log/deadbolt/audit.jsonl"
+# Set only after a separate restricted Argus collection path exists for
+# best-effort-redacted SSH stdout/stderr. Never point it at audit_path.
+# restricted_ssh_audit_path = "/var/log/deadbolt/restricted-ssh-audit.jsonl"
 bot_socket = "/run/deadbolt/bot.sock"
 profiles_path = "/etc/deadbolt/profiles.toml"
 bot_user = "deadbolt"

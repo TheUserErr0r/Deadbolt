@@ -15,6 +15,9 @@ DEFAULT_RESPONSE_TIMEOUT_SECONDS = 5
 # Covers two draining services plus fixed-policy verification while each host
 # command remains capped separately at 60 seconds.
 EMERGENCY_RESPONSE_TIMEOUT_SECONDS = 180
+# Bounds the SSH child (60 seconds) plus exact firewall verification and UFW
+# reconciliation during approval/execute. Inbound request reads remain 5 sec.
+SSH_RESPONSE_TIMEOUT_SECONDS = 150
 
 
 class ProtocolError(ValueError):

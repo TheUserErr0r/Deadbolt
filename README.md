@@ -4,7 +4,7 @@
 
 Human-approved, time-limited privileged actions for AI agents.
 
-Deadbolt is an experimental VM control plane for the Hermes agent system. Hermes sends structured requests over local Unix sockets; an unprivileged Discord bot presents them to a human operator; a root executor applies only predefined, root-owned actions. Deadbolt v0.6 supports UFW profiles, an operator-controlled emergency stop and recovery, and approved exact-host body-capture exclusions. Body capture remains disabled in the example policy until its helper and independent expiry timer are tested. Hermes cannot supply a command, arbitrary firewall rule, service name, or systemd unit. The repository contains no deployment credentials or real firewall profiles.
+Deadbolt is an experimental VM control plane for the Hermes agent system. Hermes sends structured requests over local Unix sockets; an unprivileged Discord bot presents them to a human operator; a root executor applies only predefined, root-owned actions. Deadbolt supports UFW profiles, emergency stop and recovery, exact-host body-capture exclusions, and an **opt-in managed SSH broker**. Hermes may supply a bounded structured argv for an approved SSH session, but cannot supply a shell command, arbitrary firewall rule, service name, or systemd unit. The broker is disabled in the example policy and this repository contains no deployment credentials.
 
 > **Project provenance and caution:** The design was developed by a human for an agentic use case. This entire README was AI-generated from that design and reviewed by a human. That review does not guarantee clear writing, faithful implementation of the design, or suitability for a particular VM. Treat the documentation as a guide to verify against the code and your own test environment before relying on Deadbolt for access control.
 
@@ -16,6 +16,7 @@ hermes -- /run/deadbolt/ingress/hermes.sock --> deadbolt bot (no sudo)
                                               | /run/deadbolt/bot.sock
                                               v
                                          root executor --> UFW
+                                                       --> deadbolt-ssh broker (opt-in)
                                                        --> fixed body-capture helper
                                                        --> approved exclusion file
                                                        --> dedicated nftables emergency block
@@ -29,7 +30,7 @@ The bot verifies the Hermes UID using Linux `SO_PEERCRED`. The root executor ver
 
 Requires Python 3.12 or newer. The executor uses only the Python standard library. The live bot needs `discord.py`; the unit tests and dry-run relay do not.
 
-For an isolated installation, create a Python virtual environment and install `.` for the executor or `.[bot]` for the Discord relay. The package exposes `deadbolt-executor`, `deadbolt-emergency-restore`, and `deadbolt-bot` commands.
+For an isolated installation, create a Python virtual environment and install `.` for the executor or `.[bot]` for the Discord relay. The package exposes `deadbolt-executor`, `deadbolt-emergency-restore`, `deadbolt-baseline`, `deadbolt-ssh-guard`, and `deadbolt-bot` commands.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
@@ -46,7 +47,7 @@ The badge at the top shows the latest **push** result for [Deadbolt CI](.github/
 | Unit | Policy, emergency state and recovery, exclusion matching, mocked Discord approvals, and capture helper | Pull requests and pushes |
 | Unix sockets | Real `hermes` and `deadbolt` users, peer credentials, dry-run relay, denial, and audit records | Pushes |
 | systemd restarts | Shipped service units, runtime-directory ownership, executor and bot restarts, and Hermes ingress recovery | Pushes and same-repository pull requests |
-| Firewall | UFW tagged-rule rollback and a real dedicated nftables kill-switch rule in network-isolated Docker containers | Pushes |
+| Firewall | UFW tagged-rule rollback, a real nftables kill-switch, and exact UID-scoped two-layer SSH broker grants in network-isolated Docker containers | Pushes and same-repository pull requests |
 
 Each job uses a fresh GitHub-hosted runner. No bot token, Discord server, Hermes host, or Argus service is involved.
 
@@ -94,6 +95,12 @@ Each Unix-socket exchange is one newline-terminated JSON object of at most 16 Ki
 ```
 
 The bot forwards the request to root, including the UID obtained from peer credentials. Root checks the claimed UID, action and profile, resolves fixed policy fields, and returns a request ID. The Discord card shows the exact resolved action, request ID, and approval deadline. Only the configured Discord user in the configured guild and channel can approve or deny. `/deadbolt status <request-id>` and `/deadbolt deny <request-id>` provide fallbacks.
+
+### Managed SSH sessions and durable baseline egress
+
+The opt-in `ssh-session` family is documented in the [SSH broker profile, request schema, audit fields, and migration runbook](docs/ssh-broker.md). Its approval card shows the normalized destination and pinned IP, TCP/22, fixed SSH user, TTL, purpose, command limit, and first structured argv. Approval grants a bounded **session**, not one command. Each later command is a separate validated, counted, audited JSON argv request through the dedicated `deadbolt-ssh` broker and target-side forced-command receiver. Hermes does not receive the broker key or a direct SSH firewall exception. Interactive PTY traffic is not captured or supported.
+
+Normal DNS, HTTP/HTTPS, Wazuh, and Loki connectivity belongs to the separate durable root-owned [baseline egress policy](examples/baseline-egress.toml); it is not approval-gated or TTL-bound. The baseline verification/apply command is manual and this PR does not run it. HTTP/HTTPS are already baseline open, so there are no temporary `https-web` or `https-api` profiles in this version.
 
 ### Body capture adapter
 

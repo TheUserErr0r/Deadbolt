@@ -7,4 +7,5 @@ WORKDIR /app
 COPY src/ /app/src/
 COPY tests/ci/ufw_live.py /app/ufw_live.py
 COPY tests/ci/nft_live.py /app/nft_live.py
+COPY tests/ci/broker_live.py /app/broker_live.py
 CMD ["python3", "/app/ufw_live.py"]

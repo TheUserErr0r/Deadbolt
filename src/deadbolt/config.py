@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import tomllib
 
+from deadbolt.access import AccessProfile, AccessError
+
 
 NAME = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 
@@ -84,12 +86,13 @@ class Policy:
     proxy_body_capture_enabled: bool = False
     body_exclusion_allowed_hosts: tuple[str, ...] = ()
     emergency_workload_units: tuple[str, ...] = ()
+    access_profiles: dict[str, AccessProfile] | None = None
 
     @classmethod
     def load(cls, path: Path) -> Policy:
         with path.open("rb") as stream:
             raw = tomllib.load(stream)
-        if not set(raw) <= {"firewall_profiles", "proxy_body_capture", "body_capture_exclusions", "emergency_stop"} or not isinstance(raw.get("firewall_profiles"), dict):
+        if not set(raw) <= {"firewall_profiles", "access_profiles", "proxy_body_capture", "body_capture_exclusions", "emergency_stop"} or not isinstance(raw.get("firewall_profiles"), dict):
             raise ConfigurationError("profiles.toml requires [firewall_profiles]")
         capture = raw.get("proxy_body_capture", {"enabled": False})
         if not isinstance(capture, dict) or set(capture) != {"enabled"} or type(capture["enabled"]) is not bool:
@@ -102,8 +105,16 @@ class Policy:
         if not isinstance(emergency, dict) or set(emergency) != {"workload_units"}:
             raise ConfigurationError("emergency_stop requires only workload_units")
         units = normalize_workload_units(emergency["workload_units"])
+        access_raw = raw.get("access_profiles", {})
+        if not isinstance(access_raw, dict):
+            raise ConfigurationError("access_profiles must be a table")
+        try:
+            access = {name: AccessProfile.from_mapping(name, value)
+                      for name, value in access_raw.items()}
+        except AccessError as exc:
+            raise ConfigurationError(str(exc)) from exc
         return cls({name: FirewallProfile.from_mapping(name, value)
-                    for name, value in raw["firewall_profiles"].items()}, capture["enabled"], allowed, units)
+                    for name, value in raw["firewall_profiles"].items()}, capture["enabled"], allowed, units, access)
 
 
 def normalize_hosts(value: object) -> tuple[str, ...]:
@@ -157,6 +168,7 @@ class ExecutorConfig:
     pending_ttl_seconds: int = 600
     default_ttl_seconds: int = 1800
     max_ttl_seconds: int = 3600
+    restricted_ssh_audit_path: Path | None = None
 
     @classmethod
     def load(cls, path: Path) -> ExecutorConfig:
@@ -166,7 +178,8 @@ class ExecutorConfig:
             raise ConfigurationError("executor.toml requires [executor] and [discord]")
         executor, discord = raw["executor"], raw["discord"]
         required = {"state_path", "audit_path", "bot_socket", "profiles_path", "bot_user", "hermes_user"}
-        if set(executor) != required or set(discord) != {"user_id", "guild_id", "channel_id"}:
+        if (set(executor) - required - {"restricted_ssh_audit_path"} or required - set(executor)
+                or set(discord) != {"user_id", "guild_id", "channel_id"}):
             raise ConfigurationError("unexpected or missing executor configuration fields")
         ids = [discord[key] for key in ("user_id", "guild_id", "channel_id")]
         if any(not isinstance(value, str) or not value.isdecimal() for value in ids):
@@ -179,7 +192,9 @@ class ExecutorConfig:
                    _absolute(executor["audit_path"], "audit_path"),
                    _absolute(executor["bot_socket"], "bot_socket"),
                    _absolute(executor["profiles_path"], "profiles_path"),
-                   executor["bot_user"], executor["hermes_user"], *ids)
+                   executor["bot_user"], executor["hermes_user"], *ids,
+                   restricted_ssh_audit_path=(_absolute(executor["restricted_ssh_audit_path"],
+                       "restricted_ssh_audit_path") if "restricted_ssh_audit_path" in executor else None))
 
 
 def resolve_action(action: str, profile_name: str, reason: str, requested_ttl: int | None,

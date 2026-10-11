@@ -14,7 +14,9 @@ import stat
 import time
 from typing import Any, Awaitable, Callable
 
-from deadbolt.protocol import (EMERGENCY_RESPONSE_TIMEOUT_SECONDS, MAX_MESSAGE_BYTES,
+from deadbolt.access import command_argv, destination, purpose
+
+from deadbolt.protocol import (EMERGENCY_RESPONSE_TIMEOUT_SECONDS, SSH_RESPONSE_TIMEOUT_SECONDS, MAX_MESSAGE_BYTES,
                                ProtocolError, peer_uid, read_message, require_fields, rpc,
                                write_message)
 
@@ -55,7 +57,8 @@ class Relay:
         self.emergency_stops_in_progress = 0
         self.hermes_uid = pwd.getpwnam(config.hermes_user).pw_uid
 
-    async def root(self, payload: dict[str, Any], *, emergency_response: bool = False) -> dict[str, Any]:
+    async def root(self, payload: dict[str, Any], *, emergency_response: bool = False,
+                   ssh_response: bool = False) -> dict[str, Any]:
         # Keep polling and other relay calls queued locally while a long root
         # action runs, rather than opening sockets that expire before the
         # executor's serialized action finishes.
@@ -63,6 +66,9 @@ class Relay:
             if emergency_response:
                 response = await self.root_rpc(str(self.config.executor_socket), payload,
                     response_timeout_seconds=EMERGENCY_RESPONSE_TIMEOUT_SECONDS)
+            elif ssh_response:
+                response = await self.root_rpc(str(self.config.executor_socket), payload,
+                    response_timeout_seconds=SSH_RESPONSE_TIMEOUT_SECONDS)
             else:
                 response = await self.root_rpc(str(self.config.executor_socket), payload)
         if not response.get("ok"):
@@ -74,9 +80,36 @@ class Relay:
             raise ProtocolError("unauthorized Unix peer")
         if self.emergency_stops_in_progress:
             raise ProtocolError("emergency stop in progress")
-        require_fields(message, {"op", "action", "profile", "reason"}, {"ttl_seconds", "hours"})
-        if message["op"] != "submit":
+        if message.get("op") == "ssh_execute":
+            require_fields(message, {"op", "request_id", "destination", "argv"})
+            if not isinstance(message["request_id"], str):
+                raise ProtocolError("invalid SSH request ID")
+            destination(message["destination"])
+            command_argv(message["argv"])
+            return await self.root({"op": "access_execute", "request_id": message["request_id"],
+                                    "destination": message["destination"], "argv": message["argv"],
+                                    "requested_by_uid": uid}, ssh_response=True)
+        if message.get("op") != "submit":
             raise ProtocolError("Hermes may only submit requests")
+        if message.get("action") == "access_grant":
+            require_fields(message, {"op", "action", "profile", "destination", "purpose",
+                                     "ttl_seconds", "command"})
+            if (not isinstance(message["profile"], str)
+                    or not isinstance(message["destination"], str)
+                    or not isinstance(message["purpose"], str)):
+                raise ProtocolError("invalid access fields")
+            destination(message["destination"])
+            purpose(message["purpose"])
+            if type(message["ttl_seconds"]) is not int or message["ttl_seconds"] < 1:
+                raise ProtocolError("invalid access TTL")
+            command_argv(message["command"])
+            payload = {"op": "create", "action": "access_grant", "profile": message["profile"],
+                       "destination": message["destination"], "purpose": message["purpose"],
+                       "reason": message["purpose"], "ttl_seconds": message["ttl_seconds"],
+                       "requested_by_uid": uid}
+            payload["command"] = message["command"]
+            return await self.root(payload)
+        require_fields(message, {"op", "action", "profile", "reason"}, {"ttl_seconds", "hours"})
         if message["action"] not in ("firewall_profile", "proxy_body_capture"):
             raise ProtocolError("Hermes action is not available")
         if any(not isinstance(message[key], str) for key in ("action", "profile", "reason")):
@@ -124,6 +157,12 @@ class Relay:
     async def status(self, request_id: str) -> dict[str, Any]:
         return (await self.root({"op": "status", "request_id": request_id}))["request"]
 
+    async def revoke_access(self, request_id: str, interaction_id: str, user_id: str,
+                            guild_id: str, channel_id: str) -> dict[str, Any]:
+        return (await self.root({"op": "access_revoke", "request_id": request_id,
+                                 "interaction_id": interaction_id, "user_id": user_id,
+                                 "guild_id": guild_id, "channel_id": channel_id}))["request"]
+
     async def capture_operator(self, operation: str, interaction_id: str, user_id: str,
                                guild_id: str, channel_id: str) -> dict[str, Any]:
         if operation not in ("capture_status", "capture_disable"):
@@ -165,7 +204,9 @@ class Relay:
                                  "message_id": row["posted_message_id"],
                                  "interaction_id": interaction_id},
                                  emergency_response=(decision == "approve" and
-                                                     row.get("action") == "emergency_recover")))["request"]
+                                                     row.get("action") == "emergency_recover"),
+                                 ssh_response=(decision == "approve" and
+                                               row.get("action") == "access_grant")))["request"]
 
     async def decide_posted(self, card: dict[str, Any], decision: str, message_id: str,
                             interaction_id: str, user_id: str, guild_id: str,
@@ -313,6 +354,20 @@ async def run_discord(config: BotConfig) -> None:
                                                     allowed_mentions=discord.AllowedMentions.none())
         except Exception as exc:
             await interaction.response.send_message(f"Status unavailable: {exc}", ephemeral=True)
+
+    @group.command(name="access_revoke", description="Revoke an exact temporary access grant")
+    async def access_revoke_cmd(interaction: discord.Interaction, request_id: str) -> None:
+        if not allowed(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            row = await relay.revoke_access(request_id, str(interaction.id),
+                str(interaction.user.id), str(interaction.guild_id), str(interaction.channel_id))
+            await interaction.followup.send(f"Access request {row['id']}: {row['status']}",
+                                            ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"Access revoke failed: {exc}", ephemeral=True)
 
     @group.command(name="deny", description="Deny a pending Deadbolt request")
     async def deny_cmd(interaction: discord.Interaction, request_id: str) -> None:

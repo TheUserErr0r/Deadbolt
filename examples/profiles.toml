@@ -1,6 +1,29 @@
 # Root-owned allow-list. Empty by default: no privileged action can be granted.
 [firewall_profiles]
 
+# Parameterized families are empty by default. Enabling one requires a full
+# root-owned boundary; a Hermes request supplies only destination, purpose,
+# TTL, and the first bounded argv command. Later commands share the approved
+# session but are checked and audited separately.
+[access_profiles]
+
+# [access_profiles.ssh-session]
+# direction = "out"
+# protocol = "tcp"
+# ports = [22]
+# max_ttl_seconds = 900
+# target_types = ["ip", "dns"]
+# allowed_cidrs = ["192.168.1.0/24"]
+# allow_public = false
+# operator_approval = true
+# audited_execution = true
+# ssh_user = "maintainer"
+# ssh_key = "/etc/deadbolt/keys/maintainer"
+# known_hosts = "/etc/deadbolt/known-hosts/managed"
+# remote_commands = ["uptime"]
+# max_commands = 20
+# audit_output = "metadata"
+
 # Body capture remains disabled until the versioned root-owned helper and its
 # independent expiry timer are verified on the target host.
 [proxy_body_capture]

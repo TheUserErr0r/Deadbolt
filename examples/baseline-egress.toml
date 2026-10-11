@@ -1,0 +1,4 @@
+# Root-owned, durable egress. Not exposed to Hermes or Discord and never TTL-bound.
+[baseline]
+dns_ip = "192.168.1.137"
+argus_ip = "192.168.1.208"
