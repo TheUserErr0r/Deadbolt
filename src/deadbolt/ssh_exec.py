@@ -26,6 +26,7 @@ MAX_ROOT_RESULT_BYTES = 262144
 MAX_PROGRESS_WIRE_BYTES = 16 * 1024 * 1024  # Includes bounded frame overhead.
 MAX_EXECUTION_SECONDS = 60
 BROKER_CANCELLATION_DRAIN_SECONDS = 2
+BROKER_UNIT_APPEAR_SECONDS = 5
 REMOTE_RECEIVER = "/usr/local/libexec/deadbolt-remote-exec"
 
 
@@ -273,6 +274,7 @@ class SystemdSSHExecutor:
         self._cancellations: dict[str, threading.Event] = {}
         self._partial: dict[str, dict[str, Any]] = {}
         self._done: dict[str, threading.Event] = {}
+        self._launching: set[str] = set()
         self._cancellation_lock = threading.Lock()
 
     @staticmethod
@@ -292,6 +294,7 @@ class SystemdSSHExecutor:
             event = self._cancellations.setdefault(unit, threading.Event())
             event.set()
             done = self._done.get(unit)
+            launching = unit in self._launching
         try:
             subprocess.run(["/usr/bin/systemctl", "stop", unit], shell=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -300,9 +303,41 @@ class SystemdSSHExecutor:
                                     "--value", unit], shell=False, text=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    timeout=10, check=False)
+            load = subprocess.run(["/usr/bin/systemctl", "show", "--property=LoadState",
+                                   "--value", unit], shell=False, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise AccessError("SSH unit cancellation failed") from exc
-        if state.returncode or state.stdout.strip() not in ("inactive", "failed"):
+        if load.stdout.strip() == "not-found":
+            if launching:
+                # A systemd-run invocation may be between process launch and
+                # transient-unit registration. Wait for it to appear, then stop it.
+                deadline = time.monotonic() + BROKER_UNIT_APPEAR_SECONDS
+                while time.monotonic() < deadline:
+                    if done is not None and done.is_set():
+                        break
+                    time.sleep(0.05)
+                    load = subprocess.run(["/usr/bin/systemctl", "show",
+                        "--property=LoadState", "--value", unit], shell=False,
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        timeout=10, check=False)
+                    if load.stdout.strip() != "loaded":
+                        continue
+                    subprocess.run(["/usr/bin/systemctl", "stop", unit], shell=False,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=10, check=False)
+                    state = subprocess.run(["/usr/bin/systemctl", "show",
+                        "--property=ActiveState", "--value", unit], shell=False,
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        timeout=10, check=False)
+                    if state.returncode or state.stdout.strip() not in ("inactive", "failed"):
+                        raise AccessError("SSH unit remained active after cancellation")
+                    break
+                else:
+                    raise AccessError("SSH unit creation remained uncertain after cancellation")
+        elif (load.returncode or load.stdout.strip() != "loaded" or state.returncode
+              or state.stdout.strip() not in ("inactive", "failed")):
             raise AccessError("SSH unit remained active after cancellation")
         if done is not None:
             done.wait(BROKER_CANCELLATION_DRAIN_SECONDS)
@@ -367,6 +402,7 @@ class SystemdSSHExecutor:
                 self._done.pop(unit, None)
                 self._partial.pop(unit, None)
                 self._cancellations.pop(unit, None)
+                self._launching.discard(unit)
             raise AccessError("SSH command was cancelled")
         address = canonical["pinned_ips"][0]
         prefix = "128" if ":" in address else "32"
@@ -415,8 +451,10 @@ class SystemdSSHExecutor:
                     partial[frame["stream"] + "_truncated"] |= frame["truncated"]
             return bytes(result_lines)
         try:
-            if cancelled.is_set():
-                raise AccessError("SSH command was cancelled")
+            with self._cancellation_lock:
+                if cancelled.is_set():
+                    raise AccessError("SSH command was cancelled")
+                self._launching.add(unit)
             if self.runner is _bounded_run and canonical["audit_output"] == "full":
                 status, stdout, _stderr = self.runner(command_line, b"", limit + 10,
                                                        MAX_ROOT_RESULT_BYTES, receive)
@@ -429,6 +467,7 @@ class SystemdSSHExecutor:
                 self._done[unit].set()
                 self._done.pop(unit, None)
                 self._cancellations.pop(unit, None)
+                self._launching.discard(unit)
                 if not cancelled.is_set():
                     self._partial.pop(unit, None)
         if cancelled.is_set():

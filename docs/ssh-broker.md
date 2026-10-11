@@ -133,6 +133,10 @@ stderr bytes received before cancellation as separate base64 fields, with
 explicit truncation flags. Bytes still buffered in the remote process or
 transport at termination may be unavailable; `output_incomplete` makes that
 limit explicit. The ordinary audit stream receives only interruption metadata.
+If cancellation arrives before systemd registers the transient unit, Deadbolt
+keeps the cancellation marker and refuses to launch the child when its worker
+reaches the launch gate. An absent unit is therefore a successful cancellation
+for this pre-start case.
 The root-owned state database also holds the initial canonical argv for
 approval binding. Treat the database, outbox, and restricted file as sensitive
 evidence; none is an input to the ordinary Argus relay.

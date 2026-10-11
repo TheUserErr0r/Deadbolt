@@ -19,6 +19,7 @@ from deadbolt.bot import BotConfig, Relay
 from deadbolt.config import ConfigurationError, ExecutorConfig, Policy, normalize_workload_units
 from deadbolt.executor import Executor
 from deadbolt.protocol import EMERGENCY_RESPONSE_TIMEOUT_SECONDS, ProtocolError
+from deadbolt.ssh_exec import SystemdSSHExecutor
 from deadbolt.store import StateError, Store
 
 
@@ -283,6 +284,91 @@ class EmergencyTests(unittest.TestCase):
                     self.assertTrue(self.host.units["alloy.service"])
 
         asyncio.run(exercise())
+
+    def test_emergency_before_transient_unit_exists_succeeds_and_blocks_launch(self) -> None:
+        from tests.test_access import FakeFirewall, profile
+
+        class DelayedSSH(SystemdSSHExecutor):
+            def __init__(self, path):
+                super().__init__(path, runner=lambda *args: self.fail_launch(),
+                                 owner_uid=path.parent.stat().st_uid)
+                self.ready = threading.Event()
+                self.release = threading.Event()
+
+            @staticmethod
+            def fail_launch():
+                raise AssertionError("cancelled SSH unit was launched")
+
+            def execute(self, *args):
+                self.ready.set()  # Execution is recorded; systemd-run has not started.
+                if not self.release.wait(3):
+                    raise TimeoutError("test worker was not released")
+                return super().execute(*args)
+
+        def missing_unit(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1,
+                "not-found\n" if "show" in argv else "", "")
+
+        firewall = FakeFirewall()
+        ssh = DelayedSSH(self.base / "ssh-requests")
+        self.policy = Policy({}, False, (), ("hermes-worker.service",),
+                             {"ssh-session": profile(audit_output="full")})
+        self.store.restricted_ssh_audit_path = self.base / "ssh-evidence.jsonl"
+        self.executor.policy = self.policy
+        self.executor.access_action = firewall
+        self.executor.ssh_executor = ssh
+        self.host.broker_uid = 104
+        self.executor.emergency_action = EmergencyAction(102, self.host, broker_uid=104)
+
+        async def exercise():
+            with patch("deadbolt.executor.peer_uid", return_value=101):
+                server = await asyncio.start_unix_server(self.executor.connection,
+                    str(self.config.bot_socket))
+                bot_config = BotConfig(self.base / "ingress.sock", self.config.bot_socket,
+                                       "hermes", "1", "2", "3", None, True)
+                with patch("deadbolt.bot.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=102)):
+                    relay = Relay(bot_config)
+                async with server:
+                    created = (await relay.root({"op": "create", "action": "access_grant",
+                        "profile": "ssh-session", "destination": "192.168.1.4",
+                        "purpose": "maintenance", "reason": "maintenance", "ttl_seconds": 300,
+                        "command": ["uptime", "token=exact-argv"], "requested_by_uid": 102}))["request"]
+                    await relay.root({"op": "posted", "request_id": created["id"],
+                                      "message_id": "44"})
+                    row = self.store.get(created["id"])
+                    await relay.root({"op": "decide", "request_id": row["id"],
+                        "decision": "approve", "nonce": row["nonce"],
+                        "canonical_hash": row["canonical_hash"], "user_id": "1", "guild_id": "2",
+                        "channel_id": "3", "message_id": "44", "interaction_id": "55"},
+                        ssh_response=True)
+                    command = asyncio.create_task(relay.root({"op": "access_execute",
+                        "request_id": row["id"], "requested_by_uid": 102,
+                        "destination": "192.168.1.4", "argv": ["uptime", "token=exact-argv"]},
+                        ssh_response=True))
+                    self.assertTrue(await asyncio.to_thread(ssh.ready.wait, 2))
+                    try:
+                        stopped = await asyncio.wait_for(relay.emergency_operator(
+                            "emergency_stop", "56", "1", "2", "3"), 3)
+                        self.assertEqual(stopped["state"], "active")
+                        self.assertTrue(self.host.blocked)
+                        self.assertFalse(firewall.active)
+                    finally:
+                        ssh.release.set()
+                    with self.assertRaises(ProtocolError):
+                        await asyncio.wait_for(command, 3)
+            evidence = [json.loads(line) for line in
+                self.store.restricted_ssh_audit_path.read_text().splitlines()]
+            self.assertEqual([event["event"] for event in evidence],
+                ["ssh_execution_started", "ssh_execution_interrupted"])
+            self.assertEqual(evidence[-1]["argv"], ["uptime", "token=exact-argv"])
+            self.assertEqual(evidence[-1]["stdout_b64"], "")
+            self.assertTrue(evidence[-1]["output_incomplete"])
+
+        with patch("deadbolt.ssh_exec.subprocess.run", side_effect=missing_unit), \
+             patch("deadbolt.ssh_exec.pwd.getpwnam",
+                   return_value=SimpleNamespace(pw_uid=104, pw_gid=104)), \
+             patch("deadbolt.ssh_exec._safe_root_file"):
+            asyncio.run(exercise())
 
     def test_stop_host_timeout_fails_and_preserves_egress_block(self) -> None:
         def timed_out_host(argv: list[str], input_text: str | None) -> subprocess.CompletedProcess[str]:

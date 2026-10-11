@@ -151,8 +151,9 @@ class BrokerCancellationTests(unittest.TestCase):
 
         def command(argv, **kwargs):
             calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0,
-                "inactive\n" if "show" in argv else "", "")
+            value = ("loaded\n" if "--property=LoadState" in argv else
+                     "inactive\n" if "show" in argv else "")
+            return subprocess.CompletedProcess(argv, 0, value, "")
 
         launcher = SystemdSSHExecutor()
         with patch("deadbolt.ssh_exec.subprocess.run", side_effect=command):
@@ -160,12 +161,45 @@ class BrokerCancellationTests(unittest.TestCase):
         self.assertEqual(calls[0], ["/usr/bin/systemctl", "stop", unit])
         self.assertEqual(calls[1], ["/usr/bin/systemctl", "show",
                                     "--property=ActiveState", "--value", unit])
+        self.assertEqual(calls[2], ["/usr/bin/systemctl", "show",
+                                    "--property=LoadState", "--value", unit])
         with self.assertRaises(AccessError):
             launcher.cancel("--bad.service", 1)
         with patch("deadbolt.ssh_exec.subprocess.run", side_effect=lambda argv, **kwargs:
-                   subprocess.CompletedProcess(argv, 0, "active\n", "")):
+                   subprocess.CompletedProcess(argv, 0,
+                       "loaded\n" if "--property=LoadState" in argv else "active\n", "")):
             with self.assertRaises(AccessError):
                 launcher.cancel(rid, 1)
+
+    def test_cancel_before_transient_unit_exists_prevents_late_launch(self):
+        rid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        calls = []
+        def missing_unit(argv, **kwargs):
+            calls.append(argv)
+            if "--property=LoadState" in argv:
+                return subprocess.CompletedProcess(argv, 0, "not-found\n", "")
+            if "--property=ActiveState" in argv:
+                return subprocess.CompletedProcess(argv, 0, "inactive\n", "")
+            return subprocess.CompletedProcess(argv, 5, "", "Unit not found")
+        canonical = canonical_access(profile(), "192.168.1.4", "maintenance",
+                                     300, ["uptime"])
+        with tempfile.TemporaryDirectory() as path:
+            with patch("deadbolt.ssh_exec.subprocess.run", side_effect=missing_unit), \
+                 patch("deadbolt.ssh_exec.pwd.getpwnam",
+                       return_value=type("A", (), {"pw_uid": 104, "pw_gid": 104})()), \
+                 patch("deadbolt.ssh_exec._safe_root_file"):
+                launched = []
+                launcher = SystemdSSHExecutor(Path(path),
+                    runner=lambda *args: launched.append(args),
+                    owner_uid=Path(path).stat().st_uid)
+                partial = launcher.cancel(rid, 1)
+                self.assertEqual(partial["stdout_b64"], "")
+                self.assertEqual(partial["stderr_b64"], "")
+                with self.assertRaisesRegex(AccessError, "cancelled"):
+                    launcher.execute(canonical, rid, "55", 1, ["uptime"], 1300, 1000)
+                self.assertFalse(launched)
+                self.assertFalse(list(Path(path).glob("*.json")))
+        self.assertTrue(any("--property=LoadState" in call for call in calls))
 
 
 class FakeSSH:
@@ -515,6 +549,8 @@ class SSHUnitTests(unittest.TestCase):
             if argv[1] == "stop":
                 release.set()
                 return subprocess.CompletedProcess(argv, 0, "", "")
+            if "--property=LoadState" in argv:
+                return subprocess.CompletedProcess(argv, 0, "loaded\n", "")
             return subprocess.CompletedProcess(argv, 0, "inactive\n", "")
 
         with tempfile.TemporaryDirectory() as path:
