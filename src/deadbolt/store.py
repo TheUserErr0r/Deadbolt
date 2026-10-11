@@ -8,10 +8,12 @@ import os
 from pathlib import Path
 import secrets
 import sqlite3
+import stat
 import time
 import uuid
 from typing import Any
 
+from deadbolt.access import command_summary
 from deadbolt.ssh_exec import redact
 
 
@@ -85,6 +87,16 @@ class Store:
                   "request_id": request_id, "event": event, **fields}
         self.db.execute("INSERT INTO audit_outbox(id,request_id,payload) VALUES(?,?,?)",
                         (record["event_id"], request_id, canonical_json(record)))
+
+    def _restricted_ssh_event(self, request_id: str, execution_id: str, event: str,
+                              now: float, **fields: object) -> None:
+        if self.restricted_ssh_audit_path is None:
+            raise StateError("restricted SSH audit sink is not configured")
+        record = {"event_id": str(uuid.uuid4()), "event": event,
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                  "request_id": request_id, "execution_id": execution_id, **fields}
+        self.db.execute("INSERT INTO restricted_ssh_outbox(id,payload) VALUES(?,?)",
+                        (record["event_id"], canonical_json(record)))
 
     def operator_event(self, event: str, now: float, operator_id: str,
                        interaction_id: str, result: dict[str, Any] | None = None,
@@ -201,7 +213,8 @@ class Store:
                         destination=canonical.get("destination") if canonical["action"] == "access_grant" else None,
                         pinned_ips=canonical.get("pinned_ips"), ports=canonical.get("ports"),
                         protocol=canonical.get("protocol"), purpose=canonical.get("purpose"),
-                        first_command=canonical.get("initial_command"),
+                        first_command=(command_summary(canonical["initial_command"])
+                            if canonical.get("audit_output") == "full" else canonical.get("initial_command")),
                         max_commands=canonical.get("max_commands"),
                         audit_output=canonical.get("audit_output"),
                         operation=canonical.get("operation"), hostname=canonical.get("hostname"),
@@ -267,7 +280,8 @@ class Store:
                         approved_by_discord_id=user_id, canonical_hash=canonical_hash,
                         destination=canonical.get("destination") if row["action"] == "access_grant" else None,
                         pinned_ips=canonical.get("pinned_ips"), purpose=canonical.get("purpose"),
-                        first_command=canonical.get("initial_command"),
+                        first_command=(command_summary(canonical["initial_command"])
+                            if canonical.get("audit_output") == "full" else canonical.get("initial_command")),
                         max_commands=canonical.get("max_commands"),
                         operation=canonical.get("operation"), hostname=canonical.get("hostname"),
                         resulting_hosts=canonical.get("hosts"))
@@ -392,11 +406,17 @@ class Store:
             self.db.execute("""INSERT INTO access_executions
                 (id,request_id,command_index,state,started_at) VALUES(?,?,?,?,?)""",
                 (execution_id, request_id, index, "started", now))
+            if canonical["audit_output"] == "full":
+                self._restricted_ssh_event(request_id, execution_id, "ssh_execution_started", now,
+                    approval_id=row["interaction_id"], command_index=index,
+                    destination=canonical["destination"], pinned_ip=canonical["pinned_ips"][0],
+                    ssh_user=canonical["ssh_user"], argv=command, started_at=now)
             self._event(request_id, "ssh_execution_started", now,
                         approved_by_discord_id=row["approved_by_discord_id"],
                         destination=canonical["destination"], pinned_ips=canonical["pinned_ips"],
                         ssh_user=canonical["ssh_user"], command_index=index,
-                        command=[redact(part) for part in command])
+                        command=(command_summary(command) if canonical["audit_output"] == "full"
+                                 else [redact(part) for part in command]))
         return row, execution_id, index
 
     def finish_access_execution(self, execution_id: str, now: float, result: dict[str, Any]) -> None:
@@ -404,36 +424,83 @@ class Store:
             row = self.db.execute("SELECT request_id,state FROM access_executions WHERE id=?", (execution_id,)).fetchone()
             if row is None or row["state"] != "started":
                 raise StateError("SSH execution is not in progress")
+            request = self.get(row["request_id"])
+            canonical = json.loads(request["canonical_json"])
+            if canonical["audit_output"] == "full":
+                self._restricted_ssh_event(row["request_id"], execution_id,
+                    "ssh_execution_completed", now, approval_id=request["interaction_id"],
+                    command_index=result["command_index"],
+                    destination=result["destination"], pinned_ip=result["pinned_ip"],
+                    ssh_user=result["ssh_user"], argv=result["command"],
+                    started_at=result["started_at"], finished_at=result["finished_at"],
+                    exit_code=result["exit_code"], termination=result["termination"],
+                    timed_out=result["timed_out"], stdout_b64=result["stdout_b64"],
+                    stderr_b64=result["stderr_b64"],
+                    stdout_truncated=result["stdout_truncated"],
+                    stderr_truncated=result["stderr_truncated"],
+                    output_encoding="base64")
+                self.db.execute("""UPDATE access_executions SET state='evidence_pending',
+                                   finished_at=?,result_json=? WHERE id=?""",
+                                (now, canonical_json({**{key: value for key, value in result.items()
+                                    if key not in ("command", "stdout_b64", "stderr_b64")},
+                                    "command_summary": command_summary(result["command"])}),
+                                 execution_id))
+                return
             self.db.execute("""UPDATE access_executions SET state='finished',finished_at=?,result_json=?
                                WHERE id=?""", (now, canonical_json(result), execution_id))
             self._event(row["request_id"], "ssh_execution_finished", now,
                         **{key: value for key, value in result.items()
-                           if key not in ("request_id", "stdout", "stderr")})
-            if result.get("audit_output") == "redacted":
-                if self.restricted_ssh_audit_path is None:
-                    raise StateError("restricted SSH audit sink is not configured")
-                record = {"event_id": str(uuid.uuid4()), "event": "ssh_output_redacted",
-                          "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-                          "request_id": row["request_id"], "execution_id": execution_id,
-                          "stdout": result["stdout"], "stderr": result["stderr"]}
-                self.db.execute("INSERT INTO restricted_ssh_outbox(id,payload) VALUES(?,?)",
-                                (record["event_id"], canonical_json(record)))
+                           if key not in ("request_id", "stdout", "stderr", "stdout_b64", "stderr_b64")})
+
+    def finalize_access_execution(self, execution_id: str, now: float) -> None:
+        with self.db:
+            row = self.db.execute("SELECT request_id,state,result_json FROM access_executions WHERE id=?",
+                                  (execution_id,)).fetchone()
+            if row is None or row["state"] != "evidence_pending":
+                raise StateError("SSH evidence is not awaiting delivery")
+            result = json.loads(row["result_json"])
+            self.db.execute("UPDATE access_executions SET state='finished' WHERE id=?", (execution_id,))
+            self._event(row["request_id"], "ssh_execution_finished", now,
+                approved_by_discord_id=self.get(row["request_id"])["approved_by_discord_id"],
+                command_index=result["command_index"], destination=result["destination"],
+                pinned_ip=result["pinned_ip"], ssh_user=result["ssh_user"],
+                command=result["command_summary"], exit_code=result["exit_code"],
+                started_at=result["started_at"], finished_at=result["finished_at"],
+                termination=result["termination"], timed_out=result["timed_out"],
+                stdout_truncated=result["stdout_truncated"],
+                stderr_truncated=result["stderr_truncated"], audit_output="full")
 
     def fail_access_execution(self, execution_id: str, now: float, error: str) -> None:
         with self.db:
             row = self.db.execute("SELECT request_id,state FROM access_executions WHERE id=?", (execution_id,)).fetchone()
-            if row is None or row["state"] != "started":
+            if row is None or row["state"] not in ("started", "evidence_pending"):
                 raise StateError("SSH execution is not in progress")
             self.db.execute("UPDATE access_executions SET state='failed',finished_at=? WHERE id=?",
                             (now, execution_id))
             self._event(row["request_id"], "ssh_execution_failed", now, error=error[:200])
 
     def interrupted_access_executions(self) -> list[sqlite3.Row]:
-        return list(self.db.execute("SELECT id,request_id FROM access_executions WHERE state='started'"))
+        return list(self.db.execute("""SELECT id,request_id,command_index FROM access_executions
+                                     WHERE state IN ('started','evidence_pending')"""))
+
+    def access_execution_state(self, execution_id: str) -> str:
+        row = self.db.execute("SELECT state FROM access_executions WHERE id=?", (execution_id,)).fetchone()
+        if row is None:
+            raise StateError("SSH execution is missing")
+        return row["state"]
+
+    def access_revoke_rows(self) -> list[sqlite3.Row]:
+        return list(self.db.execute("""SELECT * FROM requests WHERE action='access_grant'
+                                     AND status IN ('active','revoking') ORDER BY created_at"""))
 
     def active_access_rows(self) -> list[sqlite3.Row]:
         return list(self.db.execute("""SELECT * FROM requests WHERE action='access_grant'
                                      AND status='active' ORDER BY created_at"""))
+
+    def failed_access_rows(self) -> list[sqlite3.Row]:
+        return list(self.db.execute("""SELECT r.* FROM requests r WHERE r.action='access_grant'
+            AND r.status='active' AND EXISTS (SELECT 1 FROM access_executions e
+                WHERE e.request_id=r.id AND e.state='failed') ORDER BY r.created_at"""))
 
     def expire_pending(self, now: float) -> int:
         rows = list(self.db.execute("SELECT id FROM requests WHERE status IN ('pending','posted') AND pending_until<=?", (now,)))
@@ -475,35 +542,55 @@ class Store:
         rows = list(self.db.execute("""SELECT rowid AS seq,id,payload,'request' AS kind FROM audit_outbox WHERE flushed=0
               UNION ALL SELECT rowid AS seq,id,payload,'operator' AS kind FROM operator_audit_outbox WHERE flushed=0
               ORDER BY kind DESC,seq"""))
-        restricted = list(self.db.execute("SELECT id,payload FROM restricted_ssh_outbox WHERE flushed=0"))
-        if not rows and not restricted:
-            return 0
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        def write(path: Path, records: list[sqlite3.Row]) -> None:
-            if not records:
-                return
-            fd = os.open(path, flags, 0o600)
-            try:
-                for item in records:
-                    remaining = memoryview((item["payload"] + "\n").encode())
-                    while remaining:
-                        written = os.write(fd, remaining)
-                        if written == 0:
-                            raise OSError("audit write made no progress")
-                        remaining = remaining[written:]
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        if restricted:
-            if self.restricted_ssh_audit_path is None:
-                raise StateError("restricted SSH audit sink is not configured")
-            write(self.restricted_ssh_audit_path, restricted)
-        write(self.audit_path, rows)
+        restricted_count = self.flush_restricted_audit()
+        if not rows:
+            return restricted_count
+        self._append_records(self.audit_path, rows)
         with self.db:
             self.db.executemany("UPDATE audit_outbox SET flushed=1 WHERE id=?",
                                 [(row["id"],) for row in rows if row["kind"] == "request"])
             self.db.executemany("UPDATE operator_audit_outbox SET flushed=1 WHERE id=?",
                                 [(row["id"],) for row in rows if row["kind"] == "operator"])
+        return len(rows) + restricted_count
+
+    @staticmethod
+    def _append_records(path: Path, records: list[sqlite3.Row]) -> None:
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, 0o600)
+        try:
+            for item in records:
+                remaining = memoryview((item["payload"] + "\n").encode())
+                while remaining:
+                    written = os.write(fd, remaining)
+                    if written == 0:
+                        raise OSError("audit write made no progress")
+                    remaining = remaining[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def check_restricted_sink(self) -> None:
+        if self.restricted_ssh_audit_path is None:
+            raise StateError("restricted SSH audit sink is not configured")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.restricted_ssh_audit_path, flags, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077):
+                raise StateError("restricted SSH audit sink is not private")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def flush_restricted_audit(self) -> int:
+        restricted = list(self.db.execute("SELECT id,payload FROM restricted_ssh_outbox WHERE flushed=0"))
+        if not restricted:
+            return 0
+        self.check_restricted_sink()
+        assert self.restricted_ssh_audit_path is not None
+        self._append_records(self.restricted_ssh_audit_path, restricted)
+        with self.db:
             self.db.executemany("UPDATE restricted_ssh_outbox SET flushed=1 WHERE id=?",
                                 [(row["id"],) for row in restricted])
-        return len(rows) + len(restricted)
+        return len(restricted)

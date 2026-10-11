@@ -55,7 +55,7 @@ def main() -> int:
     if (not isinstance(message, dict) or set(message) != {"version", "argv"}
             or type(message["version"]) is not int or message["version"] != 1):
         raise ValueError("invalid command request")
-    argv = command_argv(message["argv"])
+    argv = command_argv(message["argv"], allow_sensitive=True)
     if argv[0] not in mapping:
         raise ValueError("command is not permitted")
     executable = mapping[argv[0]]

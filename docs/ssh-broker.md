@@ -48,7 +48,8 @@ than 3600 seconds, `target_types` (`ip` and/or `dns`), canonical
 `audited_execution=true`. It must also define a fixed SSH user, a key under
 `/etc/deadbolt/keys/`, a known-hosts file under
 `/etc/deadbolt/known-hosts/`, a list of 1–16 receiver command names, and a
-`max_commands` limit from 1 to 100. `audit_output` is `metadata` by default.
+`max_commands` limit from 1 to 100. `audit_output` is `metadata` by default;
+`full` requires the restricted sink below.
 The example is commented out. HTTP/HTTPS are durable baseline connectivity,
 so `https-web` and `https-api` are intentionally unavailable as temporary
 profiles.
@@ -70,7 +71,8 @@ Each message is one versioned, newline-terminated JSON object (16 KiB max) to
 ```
 
 The operator card shows the normalized host, pinned IP, TCP/22, fixed SSH
-user, purpose, TTL, command limit, and the **first** argv. The approval is
+user, purpose, TTL, command limit, and the first command name, argument count,
+and SHA-256 of its exact argv. Argument values stay out of Discord. The approval is
 bound to the canonical hash, request ID, and one-time nonce. Approval creates
 one bounded session; it does not execute the first command automatically.
 
@@ -95,19 +97,53 @@ The configured Discord user in the configured guild/channel can use
 `/deadbolt access_revoke <request-id>` to revoke immediately. Hermes ingress
 cannot revoke or query privileged status. Denial, expiry, command failures,
 reconciliation, and revoke appear in the existing root-owned JSONL audit
-stream, relayed to Argus as before. Each command record includes timestamps,
-approval ID, request ID, index, target/IP, user, redacted argv, exit code, and
-outcome. Unknown secrets cannot be detected reliably: keep secrets out of
-argv, purpose, and command output.
+stream, relayed to Argus as before. The ordinary stream records timestamps,
+approval ID, request ID, index, target/IP, user, an argv hash and count,
+exit code, termination state, and explicit truncation flags. It contains no
+full-mode argument values or command output. Purpose remains short and
+secret-free.
 
-`audit_output="redacted"` is optional only when
-`restricted_ssh_audit_path` points to a **separate root-owned file** in the
-executor config and an operator has arranged restricted Argus collection for
-that file. The ordinary Deadbolt audit stream contains metadata only. The
-restricted stream gets at most 4096 bytes of stdout and stderr per command
-after known-pattern redaction. Redaction is best-effort, not a guarantee
-against unknown secrets. No restricted path is set by default, so enabling
-this mode without one fails closed. This PR does not change Argus deployment.
+Set `audit_output="full"` only in a root-owned profile and configure
+`restricted_ssh_audit_path="/var/log/deadbolt/ssh-evidence.jsonl"` in the
+root-owned executor config. This exact Hermes source path is the required
+input to a **separate restricted Argus collection pipeline**; the proposed
+restricted destination is `/var/lib/argus/deadbolt-ssh/evidence.jsonl` on
+Argus. Neither path is collected by the ordinary Deadbolt audit relay or
+ordinary Loki/Grafana stream. The local source is root-owned mode 0600.
+Provision the restricted collector and access controls separately before
+enabling a full profile. This PR does not deploy or configure Argus.
+
+For full mode, the restricted JSONL file contains one `ssh_execution_started`
+event, durably appended before the SSH child starts, and one
+`ssh_execution_completed` event per command. Both include the exact structured
+`argv`, request ID, approval ID, execution ID, command index, destination,
+pinned IP, SSH user, and timestamp. Completion adds start/finish times, exit
+code, `termination` (`exit`, `signal`, or `timeout`), `timed_out`, and separate
+`stdout_b64` and `stderr_b64` fields. Base64 preserves arbitrary bytes without
+redaction. Each decoded stream is capped at **65,536 bytes**; a corresponding
+`stdout_truncated` or `stderr_truncated` boolean is true if more bytes were
+produced. Excess bytes are drained and discarded. Truncation is never silent.
+The restricted SQLite outbox also contains these records until delivery.
+The root-owned state database also holds the initial canonical argv for
+approval binding. Treat the database, outbox, and restricted file as sensitive
+evidence; none is an input to the ordinary Argus relay.
+
+Before granting full mode, Deadbolt checks that the restricted file is private
+and writable. A restricted start-record flush failure prevents execution and
+revokes the grant. A completion-record flush failure marks the execution
+failed for inspection and revokes the grant. A completed SSH result is returned
+only after the completion evidence is durably queued and flushed. On restart,
+incomplete evidence delivery closes the session. Metadata mode retains its
+prior output-discarding behavior and needs no restricted sink.
+
+Deployment verification: configure the restricted Argus collector for the
+Hermes source path above with access limited to authorized reviewers, verify
+its destination is the restricted Argus path, and confirm neither the ordinary
+`/var/log/deadbolt/audit.jsonl` relay nor Loki/Grafana ingests this file. Then
+enable a test full profile, run one harmless command, confirm start and
+completion records on the restricted destination with matching event IDs,
+and verify no argv values or output appear in Discord or the ordinary audit
+stream. Keep the full profile disabled if any check fails.
 
 ## Target receiver
 

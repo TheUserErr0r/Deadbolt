@@ -1,8 +1,10 @@
 """Broker approval, exact firewall, recovery, and audit tests."""
 import asyncio
+import base64
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,7 +14,8 @@ from deadbolt.bot import BotConfig, Relay
 from deadbolt.broker_firewall import BrokerFirewall, BrokerFirewallError
 from deadbolt.config import ExecutorConfig, Policy
 from deadbolt.executor import Executor
-from deadbolt.ssh_exec import SystemdSSHExecutor, redact, _ssh_argv
+from deadbolt.ssh_exec import (CaptureResult, MAX_OUTPUT_BYTES, SystemdSSHExecutor,
+                                _capture_run, redact, run_child, _ssh_argv)
 from deadbolt.store import StateError, Store
 
 
@@ -139,6 +142,31 @@ class FirewallTests(unittest.TestCase):
             BrokerFirewall(104, run)._check_static_bypass()
 
 
+class BrokerCancellationTests(unittest.TestCase):
+    def test_cancel_uses_fixed_unit_and_requires_inactive_state(self):
+        rid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        unit = f"deadbolt-ssh-{rid}-1.service"
+        calls = []
+
+        def command(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0,
+                "inactive\n" if "show" in argv else "", "")
+
+        launcher = SystemdSSHExecutor()
+        with patch("deadbolt.ssh_exec.subprocess.run", side_effect=command):
+            launcher.cancel(rid, 1)
+        self.assertEqual(calls[0], ["/usr/bin/systemctl", "stop", unit])
+        self.assertEqual(calls[1], ["/usr/bin/systemctl", "show",
+                                    "--property=ActiveState", "--value", unit])
+        with self.assertRaises(AccessError):
+            launcher.cancel("--bad.service", 1)
+        with patch("deadbolt.ssh_exec.subprocess.run", side_effect=lambda argv, **kwargs:
+                   subprocess.CompletedProcess(argv, 0, "active\n", "")):
+            with self.assertRaises(AccessError):
+                launcher.cancel(rid, 1)
+
+
 class FakeSSH:
     def __init__(self):
         self.calls = []
@@ -148,7 +176,9 @@ class FakeSSH:
         return dict(request_id=request_id, approval_id=approval_id, command_index=index,
             started_at=now, finished_at=now + 1, destination=canonical["destination"],
             pinned_ip=canonical["pinned_ips"][0], ssh_user=canonical["ssh_user"],
-            command=argv, exit_code=0, audit_output="metadata", stdout=None, stderr=None)
+            command=argv, exit_code=0, termination="exit", timed_out=False,
+            audit_output="metadata", stdout_b64=None, stderr_b64=None,
+            stdout_truncated=False, stderr_truncated=False)
 
 
 class SessionTests(unittest.TestCase):
@@ -181,10 +211,10 @@ class SessionTests(unittest.TestCase):
     def call(self, payload):
         return asyncio.run(self.executor.dispatch(payload, 101))
 
-    def request(self):
+    def request(self, command=None):
         row = self.call(dict(op="create", action="access_grant", profile="ssh-session",
             destination="host.example", purpose="maintenance", reason="maintenance",
-            ttl_seconds=300, command=["uptime"], requested_by_uid=102))["request"]
+            ttl_seconds=300, command=command or ["uptime"], requested_by_uid=102))["request"]
         self.call(dict(op="posted", request_id=row["id"], message_id="44"))
         return self.call(dict(op="list", state="posted"))["requests"][0]
 
@@ -263,6 +293,101 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(self.ssh.calls)
         self.assertFalse(self.firewall.active)
 
+    def _full_evidence_profile(self):
+        policy = Policy({}, access_profiles={"ssh-session": profile(audit_output="full")})
+        self.executor.policy = policy
+        self.executor.policy_loader = lambda: policy
+        self.store.restricted_ssh_audit_path = self.store.audit_path.parent / "ssh-evidence.jsonl"
+
+        class FullSSH(FakeSSH):
+            def execute(self, canonical, request_id, approval_id, index, argv, expiry, now):
+                self.calls.append((request_id, index, argv))
+                return dict(request_id=request_id, approval_id=approval_id,
+                    command_index=index, started_at=now, finished_at=now + 1,
+                    destination=canonical["destination"], pinned_ip=canonical["pinned_ips"][0],
+                    ssh_user=canonical["ssh_user"], command=argv, exit_code=0,
+                    termination="exit", timed_out=False, audit_output="full",
+                    stdout_b64=base64.b64encode(b"stdout-secret").decode(),
+                    stderr_b64=base64.b64encode(b"stderr-secret").decode(),
+                    stdout_truncated=False, stderr_truncated=False)
+
+        self.ssh = FullSSH()
+        self.executor.ssh_executor = self.ssh
+
+    def test_full_evidence_stays_out_of_card_response_and_normal_audit(self):
+        self._full_evidence_profile()
+        row = self.request(["uptime", "token=argument-secret"])
+        self.assertNotIn("argument-secret", row["description"])
+        self.approve(row)
+        response = self.execute(row, ["uptime", "token=argument-secret"])
+        self.assertEqual(response["ssh"]["exit_code"], 0)
+        self.assertNotIn("secret", json.dumps(response))
+        ordinary = self.store.audit_path.read_text()
+        for secret in ("argument-secret", "stdout-secret", "stderr-secret"):
+            self.assertNotIn(secret, ordinary)
+        restricted = self.store.restricted_ssh_audit_path.read_text()
+        self.assertIn("argument-secret", restricted)
+        self.assertIn(base64.b64encode(b"stdout-secret").decode(), restricted)
+        self.assertIn(base64.b64encode(b"stderr-secret").decode(), restricted)
+
+    def test_full_evidence_preflight_failure_prevents_execution(self):
+        self._full_evidence_profile()
+        row = self.request(["uptime", "token=argument-secret"])
+        self.approve(row)
+        with patch.object(self.store, "flush_restricted_audit", side_effect=OSError("disk full")):
+            with self.assertRaises(Exception):
+                self.execute(row, ["uptime", "token=argument-secret"])
+        self.assertFalse(self.ssh.calls)
+        self.assertFalse(self.firewall.active)
+        self.assertEqual(self.store.get(row["id"])["status"], "rolled_back")
+
+    def test_full_profile_requires_private_restricted_sink(self):
+        self._full_evidence_profile()
+        self.store.restricted_ssh_audit_path = None
+        with self.assertRaises(AccessError):
+            self.request(["uptime", "token=argument-secret"])
+        self.assertFalse(self.firewall.active)
+
+    def test_full_evidence_completion_failure_revokes_and_marks_for_inspection(self):
+        self._full_evidence_profile()
+        row = self.request(["uptime", "token=argument-secret"])
+        self.approve(row)
+        real_flush = self.store.flush_restricted_audit
+        calls = 0
+
+        def fail_completion():
+            nonlocal calls
+            calls += 1
+            if calls >= 3:
+                raise OSError("restricted disk full")
+            return real_flush()
+
+        with patch.object(self.store, "flush_restricted_audit", side_effect=fail_completion):
+            with self.assertRaises(Exception):
+                self.execute(row, ["uptime", "token=argument-secret"])
+        self.assertEqual(len(self.ssh.calls), 1)
+        self.assertFalse(self.firewall.active)
+        saved = self.store.get(row["id"])
+        self.assertEqual(saved["status"], "rolled_back")
+        self.assertIn("inspect", saved["last_error"])
+        execution = self.store.db.execute("SELECT state FROM access_executions WHERE request_id=?",
+                                          (row["id"],)).fetchone()
+        self.assertEqual(execution["state"], "failed")
+
+    def test_restart_does_not_regrant_failed_evidence_session(self):
+        self._full_evidence_profile()
+        row = self.request(["uptime", "token=argument-secret"])
+        self.approve(row)
+        _, execution_id, _ = self.store.begin_access_execution(
+            row["id"], ["uptime", "token=argument-secret"], self.now)
+        self.store.fail_access_execution(execution_id, self.now,
+            "restricted SSH evidence delivery failed; inspect session")
+        self.firewall.active.clear()
+        before = self.firewall.reinstalls
+        asyncio.run(self.executor.reconcile())
+        self.assertEqual(self.store.get(row["id"])["status"], "rolled_back")
+        self.assertEqual(self.firewall.reinstalls, before)
+
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
     async def test_hermes_cannot_revoke_or_send_shell_string(self):
@@ -286,34 +411,97 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AuditTests(unittest.TestCase):
-    def test_output_is_only_in_restricted_file(self):
+    def test_full_argv_and_streams_are_only_in_restricted_file(self):
         with tempfile.TemporaryDirectory() as base:
             root = Path(base)
             store = Store(root / "state.db", root / "audit.jsonl", 600,
                           root / "restricted.jsonl")
-            canonical = canonical_access(profile(audit_output="redacted"),
-                "192.168.1.4", "maintenance", 300, ["uptime"])
+            command = ["uptime", "token=topsecret"]
+            canonical = canonical_access(profile(audit_output="full"),
+                "192.168.1.4", "maintenance", 300, command)
             row = store.create(canonical, "card", 100, 1000)
             row = store.mark_posted(row["id"], "44", 1001)
             store.decide(row["id"], "approve", row["nonce"], row["canonical_hash"],
                          "1", "2", "3", "44", "55", ("1", "2", "3"), 1002)
             store.mark_executing(row["id"], {"expiry": 1302}, 1002)
             store.mark_active(row["id"], 1002, active_until=1302)
-            _, execution_id, _ = store.begin_access_execution(row["id"], ["uptime"], 1003)
+            _, execution_id, _ = store.begin_access_execution(row["id"], command, 1003)
+            store.flush_restricted_audit()
             store.finish_access_execution(execution_id, 1004,
-                {"request_id": row["id"], "exit_code": 0, "audit_output": "redacted",
-                 "stdout": "safe output", "stderr": ""})
+                {"request_id": row["id"], "approval_id": "55", "command_index": 1,
+                 "destination": "192.168.1.4", "pinned_ip": "192.168.1.4",
+                 "ssh_user": "maintainer", "started_at": 1003, "finished_at": 1004,
+                 "command": command, "exit_code": 0, "termination": "exit",
+                 "timed_out": False, "audit_output": "full",
+                 "stdout_b64": base64.b64encode(b"token=stdout-secret").decode(),
+                 "stderr_b64": base64.b64encode(b"password=stderr-secret").decode(),
+                 "stdout_truncated": True, "stderr_truncated": False})
+            store.flush_restricted_audit()
+            store.finalize_access_execution(execution_id, 1004)
             store.flush_audit()
-            self.assertNotIn("safe output", (root / "audit.jsonl").read_text())
-            self.assertIn("safe output", (root / "restricted.jsonl").read_text())
+            ordinary = (root / "audit.jsonl").read_text()
+            restricted = [json.loads(line) for line in (root / "restricted.jsonl").read_text().splitlines()]
+            for secret in ("topsecret", "stdout-secret", "stderr-secret"):
+                self.assertNotIn(secret, ordinary)
+            self.assertEqual(restricted[0]["argv"], command)
+            self.assertEqual(restricted[1]["argv"], command)
+            self.assertEqual(restricted[1]["execution_id"], execution_id)
+            self.assertEqual(base64.b64decode(restricted[1]["stdout_b64"]), b"token=stdout-secret")
+            self.assertEqual(base64.b64decode(restricted[1]["stderr_b64"]), b"password=stderr-secret")
+            self.assertEqual(restricted[1]["termination"], "exit")
+            self.assertTrue(restricted[1]["stdout_truncated"])
+            self.assertFalse(restricted[1]["stderr_truncated"])
             store.close()
 
     def test_redaction_is_best_effort(self):
         self.assertEqual(redact("token=abc https://example.com/key"),
                          "token=[REDACTED] [URL REDACTED]")
 
+    def test_capture_truncation_is_explicit_and_separate(self):
+        script = ("import sys; sys.stdout.buffer.write(b'A'*70000); "
+                  "sys.stderr.buffer.write(b'B'*70001)")
+        result = _capture_run([sys.executable, "-c", script], b"", 5)
+        self.assertEqual(len(result.stdout), MAX_OUTPUT_BYTES)
+        self.assertEqual(len(result.stderr), MAX_OUTPUT_BYTES)
+        self.assertEqual(result.stdout, b"A" * MAX_OUTPUT_BYTES)
+        self.assertEqual(result.stderr, b"B" * MAX_OUTPUT_BYTES)
+        self.assertTrue(result.stdout_truncated)
+        self.assertTrue(result.stderr_truncated)
+        self.assertFalse(result.timed_out)
+
+    def test_capture_timeout_reports_partial_bytes(self):
+        script = ("import sys,time; sys.stdout.buffer.write(b'before-timeout'); "
+                  "sys.stdout.flush(); time.sleep(2)")
+        result = _capture_run([sys.executable, "-c", script], b"", 0.1)
+        self.assertTrue(result.timed_out)
+        self.assertIsNone(result.exit_code)
+        self.assertEqual(result.stdout, b"before-timeout")
+        self.assertEqual(result.stderr, b"")
+
 
 class SSHUnitTests(unittest.TestCase):
+    def test_child_full_mode_preserves_exact_command_and_binary_streams(self):
+        record = {"version": 1, "request_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "approval_id": "55", "command_index": 1, "destination": "host.example",
+            "pinned_ip": "192.168.1.4", "ssh_user": "maintainer",
+            "ssh_key": "/etc/deadbolt/keys/maintainer",
+            "known_hosts": "/etc/deadbolt/known-hosts/managed",
+            "argv": ["uptime", "token=topsecret"], "audit_output": "full",
+            "expires_at": 1300, "timeout_seconds": 60}
+        identity = type("Account", (), {"pw_name": "deadbolt-ssh", "pw_uid": 104,
+                                        "pw_gid": 104})()
+        with (patch("deadbolt.ssh_exec.pwd.getpwuid", return_value=identity),
+              patch("deadbolt.ssh_exec.pwd.getpwnam", return_value=identity),
+              patch("deadbolt.ssh_exec.os.geteuid", return_value=104),
+              patch("deadbolt.ssh_exec._safe_root_file")):
+            result = run_child(record, runner=lambda argv, payload, timeout:
+                CaptureResult(0, b"\x00token=out", b"password=err\xff", False, True, False),
+                now=lambda: 1000)
+        self.assertEqual(result["command"], record["argv"])
+        self.assertEqual(base64.b64decode(result["stdout_b64"]), b"\x00token=out")
+        self.assertEqual(base64.b64decode(result["stderr_b64"]), b"password=err\xff")
+        self.assertTrue(result["stderr_truncated"])
+
     def test_fixed_receiver_no_tty_or_forwarding(self):
         argv = _ssh_argv({"ssh_user": "maintainer",
             "ssh_key": "/etc/deadbolt/keys/maintainer",
@@ -335,8 +523,9 @@ class SSHUnitTests(unittest.TestCase):
             result = dict(request_id=rid, approval_id="55", command_index=1,
                 started_at=1000, finished_at=1001, destination="192.168.1.4",
                 pinned_ip="192.168.1.4", ssh_user="maintainer",
-                command=["uptime"], exit_code=0, audit_output="metadata",
-                stdout=None, stderr=None)
+                command=["uptime"], exit_code=0, termination="exit", timed_out=False,
+                audit_output="metadata", stdout_b64=None, stderr_b64=None,
+                stdout_truncated=False, stderr_truncated=False)
             return 0, json.dumps(result) + "\n", ""
         with tempfile.TemporaryDirectory() as path:
             with patch("deadbolt.ssh_exec.pwd.getpwnam",
@@ -349,4 +538,4 @@ class SSHUnitTests(unittest.TestCase):
         self.assertIn("--property=User=deadbolt-ssh", calls[0])
         self.assertIn("--property=IPAddressDeny=any", calls[0])
         self.assertIn("--property=IPAddressAllow=192.168.1.4/32", calls[0])
-        self.assertIsNone(result["stdout"])
+        self.assertIsNone(result["stdout_b64"])

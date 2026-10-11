@@ -59,6 +59,14 @@ class Relay:
 
     async def root(self, payload: dict[str, Any], *, emergency_response: bool = False,
                    ssh_response: bool = False) -> dict[str, Any]:
+        if payload.get("op") == "emergency_stop" and emergency_response:
+            # The kill switch must not queue behind a running SSH RPC. The
+            # executor independently authenticates and validates this call.
+            response = await self.root_rpc(str(self.config.executor_socket), payload,
+                response_timeout_seconds=EMERGENCY_RESPONSE_TIMEOUT_SECONDS)
+            if not response.get("ok"):
+                raise ProtocolError(str(response.get("error", "executor rejected request")))
+            return response
         # Keep polling and other relay calls queued locally while a long root
         # action runs, rather than opening sockets that expire before the
         # executor's serialized action finishes.
@@ -85,7 +93,7 @@ class Relay:
             if not isinstance(message["request_id"], str):
                 raise ProtocolError("invalid SSH request ID")
             destination(message["destination"])
-            command_argv(message["argv"])
+            command_argv(message["argv"], allow_sensitive=True)
             return await self.root({"op": "access_execute", "request_id": message["request_id"],
                                     "destination": message["destination"], "argv": message["argv"],
                                     "requested_by_uid": uid}, ssh_response=True)
@@ -102,7 +110,7 @@ class Relay:
             purpose(message["purpose"])
             if type(message["ttl_seconds"]) is not int or message["ttl_seconds"] < 1:
                 raise ProtocolError("invalid access TTL")
-            command_argv(message["command"])
+            command_argv(message["command"], allow_sensitive=True)
             payload = {"op": "create", "action": "access_grant", "profile": message["profile"],
                        "destination": message["destination"], "purpose": message["purpose"],
                        "reason": message["purpose"], "ttl_seconds": message["ttl_seconds"],

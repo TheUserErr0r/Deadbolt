@@ -180,9 +180,19 @@ class BrokerFirewall:
     def revoke(self, ip: str, request_id: str, expiry: int) -> None:
         ip, set_name = self._address(ip)
         tag = self._identity(request_id, expiry)
-        if self._ufw_present(ip, tag, expiry):
-            self._iptables(ip, "-D", self.UFW_CHAIN, *self._ufw_args(ip, tag, expiry))
-        if self._element_present(ip, set_name, tag):
-            self._nft("delete", "element", "inet", self.TABLE, set_name, "{", ip, "}")
-        if self._ufw_present(ip, tag, expiry) or self._element_present(ip, set_name, tag):
+        # Remove the early nft accept first. If UFW deletion then fails, the
+        # broker-wide nft deny still prevents this destination's SSH egress.
+        self.ensure_guard()
+        failed = False
+        try:
+            if self._element_present(ip, set_name, tag):
+                self._nft("delete", "element", "inet", self.TABLE, set_name, "{", ip, "}")
+        except BrokerFirewallError:
+            failed = True
+        try:
+            if self._ufw_present(ip, tag, expiry):
+                self._iptables(ip, "-D", self.UFW_CHAIN, *self._ufw_args(ip, tag, expiry))
+        except BrokerFirewallError:
+            failed = True
+        if failed or self._ufw_present(ip, tag, expiry) or self._element_present(ip, set_name, tag):
             raise BrokerFirewallError("broker grant remains after revoke")

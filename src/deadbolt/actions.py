@@ -421,8 +421,10 @@ class EmergencyAction:
     HOST_COMMAND_TIMEOUT_SECONDS = 60
 
     def __init__(self, hermes_uid: int,
-                 runner: Callable[[list[str], str | None], subprocess.CompletedProcess[str]] | None = None):
+                 runner: Callable[[list[str], str | None], subprocess.CompletedProcess[str]] | None = None,
+                 *, broker_uid: int | None = None):
         self.hermes_uid = hermes_uid
+        self.broker_uid = broker_uid
         self.runner = runner or self._run_process
 
     @staticmethod
@@ -452,18 +454,22 @@ class EmergencyAction:
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             raise ActionError("invalid nftables status") from exc
 
-    def enabled(self) -> bool:
+    def _block_state(self) -> str:
         tables = self._objects(self._call(["/usr/sbin/nft", "-j", "list", "tables", "inet"]))
         found = [value for key, value in tables if key == "table" and
                  value.get("family") == "inet" and value.get("name") == self.table]
         if len(found) > 1:
             raise ActionError("ambiguous emergency nftables table")
         if not found:
-            return False
+            return "absent"
         objects = self._objects(self._call(["/usr/sbin/nft", "-j", "list", "table", "inet", self.table]))
-        if len(objects) != 3 or [key for key, _ in objects] != ["table", "chain", "rule"]:
+        if [key for key, _ in objects[:2]] != ["table", "chain"] or len(objects) not in (3, 4):
             raise ActionError("emergency nftables table was changed externally")
-        table, chain, rule = (value for _, value in objects)
+        table, chain = (value for _, value in objects[:2])
+        rules = [value for key, value in objects[2:] if key == "rule"]
+        if len(rules) != len(objects) - 2:
+            raise ActionError("emergency nftables table was changed externally")
+        rule = rules[0]
         expression = [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}},
                                   "right": self.hermes_uid}}, {"drop": None}]
         if (table.get("family") != "inet" or table.get("name") != self.table
@@ -474,16 +480,38 @@ class EmergencyAction:
                 or rule.get("table") != self.table or rule.get("chain") != self.chain
                 or rule.get("comment") != self.comment or rule.get("expr") != expression):
             raise ActionError("emergency nftables rule was changed externally")
-        return True
+        if len(rules) == 2:
+            broker_expression = [
+                {"match": {"op": "==", "left": {"meta": {"key": "skuid"}},
+                           "right": self.broker_uid}},
+                {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}},
+                           "right": 22}}, {"drop": None}]
+            broker = rules[1]
+            if (self.broker_uid is None or broker.get("family") != "inet"
+                    or broker.get("table") != self.table or broker.get("chain") != self.chain
+                    or broker.get("comment") != "deadbolt:emergency-broker-ssh"
+                    or broker.get("expr") != broker_expression):
+                raise ActionError("emergency broker rule was changed externally")
+            return "complete"
+        return "legacy" if self.broker_uid is not None else "complete"
 
-    def _install_block(self) -> None:
-        if self.enabled():
+    def enabled(self) -> bool:
+        return self._block_state() == "complete"
+
+    def install_block(self) -> None:
+        state = self._block_state()
+        if state == "complete":
             return
-        script = (f"add table inet {self.table}\n"
-                  f"add chain inet {self.table} {self.chain} "
-                  "{ type filter hook output priority -150; policy accept; }\n"
-                  f"add rule inet {self.table} {self.chain} meta skuid {self.hermes_uid} "
-                  f'drop comment "{self.comment}"\n')
+        script = ""
+        if state == "absent":
+            script = (f"add table inet {self.table}\n"
+                      f"add chain inet {self.table} {self.chain} "
+                      "{ type filter hook output priority -150; policy accept; }\n"
+                      f"add rule inet {self.table} {self.chain} meta skuid {self.hermes_uid} "
+                      f'drop comment "{self.comment}"\n')
+        if self.broker_uid is not None:
+            script += (f"add rule inet {self.table} {self.chain} meta skuid {self.broker_uid} "
+                       'tcp dport 22 drop comment "deadbolt:emergency-broker-ssh"\n')
         self._call(["/usr/sbin/nft", "-f", "-"], script)
         if not self.enabled():
             raise ActionError("emergency block could not be verified")
@@ -509,14 +537,14 @@ class EmergencyAction:
     def enforce(self, workload_units: tuple[str, ...]) -> None:
         from deadbolt.config import normalize_workload_units
         normalize_workload_units(list(workload_units))
-        self._install_block()
+        self.install_block()
         for unit in (self.proxy_unit, *workload_units):
             self._call(["/usr/bin/systemctl", "stop", unit])
         if self.active_units(workload_units):
             raise ActionError("emergency service remained active after stop")
         # A slow service drain leaves time for external firewall changes. Do
         # not report success unless the UID block is still present at the end.
-        self._install_block()
+        self.install_block()
 
     def recover(self, previously_active: tuple[str, ...], workload_units: tuple[str, ...]) -> None:
         from deadbolt.config import normalize_workload_units

@@ -23,6 +23,8 @@
 # remote_commands = ["uptime"]
 # max_commands = 20
 # audit_output = "metadata"
+# To capture exact argv and bounded stdout/stderr in the separate restricted
+# evidence sink, set audit_output = "full" and configure its executor path.
 
 # Body capture remains disabled until the versioned root-owned helper and its
 # independent expiry timer are verified on the target host.

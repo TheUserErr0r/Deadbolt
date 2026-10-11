@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -28,6 +29,8 @@ class FakeHost:
                       "deadbolt-bot.service": True, "alloy.service": True}
         self.calls: list[tuple[list[str], str | None]] = []
         self.fail_start = False
+        self.broker_uid: int | None = None
+        self.broker_installed = False
 
     def __call__(self, argv: list[str], input_text: str | None) -> subprocess.CompletedProcess[str]:
         self.calls.append((argv[:], input_text))
@@ -47,12 +50,26 @@ class FakeHost:
                     {"rule": {"family": "inet", "table": "deadbolt_killswitch", "chain": "output",
                               "expr": expression, "comment": "changed" if self.changed_rule else
                               "deadbolt:emergency-stop"}}]}
+                if self.broker_uid is not None and self.broker_installed:
+                    data["nftables"].append({"rule": {
+                        "family": "inet", "table": "deadbolt_killswitch", "chain": "output",
+                        "expr": [
+                            {"match": {"op": "==", "left": {"meta": {"key": "skuid"}},
+                                       "right": self.broker_uid}},
+                            {"match": {"op": "==", "left": {"payload": {"protocol": "tcp",
+                                                                               "field": "dport"}},
+                                       "right": 22}}, {"drop": None}],
+                        "comment": "deadbolt:emergency-broker-ssh"}})
                 return subprocess.CompletedProcess(argv, 0, json.dumps(data), "")
             if argv[1:] == ["-f", "-"] and input_text is not None:
                 if input_text.startswith("add table inet deadbolt_killswitch\n"):
                     self.blocked = True
+                    self.broker_installed = "deadbolt:emergency-broker-ssh" in input_text
+                elif input_text.startswith("add rule inet deadbolt_killswitch output meta skuid"):
+                    self.broker_installed = "deadbolt:emergency-broker-ssh" in input_text
                 elif input_text == "delete table inet deadbolt_killswitch\n":
                     self.blocked = False
+                    self.broker_installed = False
                 else:
                     return subprocess.CompletedProcess(argv, 1, "", "unexpected nft script")
                 return subprocess.CompletedProcess(argv, 0, "", "")
@@ -94,6 +111,7 @@ class EmergencyTests(unittest.TestCase):
             self.base / "bot.sock", self.base / "profiles.toml", "deadbolt", "hermes",
             "1", "2", "3")
         self.config = config
+        config.profiles_path.write_text("[firewall_profiles]\n")
         lookup = lambda name: SimpleNamespace(pw_uid=101 if name == "deadbolt" else 102,
                                               pw_gid=201 if name == "deadbolt" else 202)
         self.patcher = patch("deadbolt.executor.pwd.getpwnam", side_effect=lookup)
@@ -167,6 +185,79 @@ class EmergencyTests(unittest.TestCase):
                     self.assertFalse(self.host.units["hermes-tls-proxy.service"])
                     self.assertFalse(self.host.units["hermes-worker.service"])
                     self.assertEqual(await asyncio.wait_for(polling, timeout=3), [])
+
+        asyncio.run(exercise())
+
+    def test_hung_broker_command_is_preempted_and_egress_revoked(self) -> None:
+        from tests.test_access import FakeFirewall, FakeSSH, profile
+
+        class HungSSH(FakeSSH):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = threading.Event()
+                self.released = threading.Event()
+                self.cancelled = False
+
+            def execute(self, *args):
+                self.started.set()
+                if not self.released.wait(20):
+                    raise TimeoutError("hung test SSH command")
+                return super().execute(*args)
+
+            def cancel(self, request_id, command_index):
+                self.cancelled = True
+                self.released.set()
+
+        firewall, ssh = FakeFirewall(), HungSSH()
+        self.policy = Policy({}, False, (), ("hermes-worker.service",),
+                             {"ssh-session": profile()})
+        self.executor.policy = self.policy
+        self.executor.access_action = firewall
+        self.executor.ssh_executor = ssh
+        self.host.broker_uid = 104
+        self.executor.emergency_action = EmergencyAction(102, self.host, broker_uid=104)
+
+        async def exercise() -> None:
+            with patch("deadbolt.executor.peer_uid", return_value=101):
+                server = await asyncio.start_unix_server(self.executor.connection,
+                    str(self.config.bot_socket))
+                bot_config = BotConfig(self.base / "ingress.sock", self.config.bot_socket,
+                                       "hermes", "1", "2", "3", None, True)
+                with patch("deadbolt.bot.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=102)):
+                    relay = Relay(bot_config)
+                async with server:
+                    created = (await relay.root({"op": "create", "action": "access_grant",
+                        "profile": "ssh-session", "destination": "192.168.1.4",
+                        "purpose": "maintenance", "reason": "maintenance", "ttl_seconds": 300,
+                        "command": ["uptime"], "requested_by_uid": 102}))["request"]
+                    await relay.root({"op": "posted", "request_id": created["id"], "message_id": "44"})
+                    posted = (await relay.root({"op": "list", "state": "posted", "offset": 0}))["requests"][0]
+                    approved = (await relay.root({"op": "decide", "request_id": posted["id"],
+                        "decision": "approve", "nonce": posted["nonce"],
+                        "canonical_hash": posted["canonical_hash"], "user_id": "1",
+                        "guild_id": "2", "channel_id": "3", "message_id": "44",
+                        "interaction_id": "55"}, ssh_response=True))["request"]
+                    self.assertEqual(approved["status"], "active")
+                    self.assertIn(created["id"], firewall.active)
+                    command = asyncio.create_task(relay.root({"op": "access_execute",
+                        "request_id": created["id"], "requested_by_uid": 102,
+                        "destination": "192.168.1.4", "argv": ["uptime"]}, ssh_response=True))
+                    self.assertTrue(await asyncio.to_thread(ssh.started.wait, 2))
+                    started = time.monotonic()
+                    result = await asyncio.wait_for(relay.emergency_operator(
+                        "emergency_stop", "56", "1", "2", "3"), timeout=3)
+                    self.assertLess(time.monotonic() - started, 3)
+                    self.assertEqual(result["state"], "active")
+                    self.assertTrue(ssh.cancelled)
+                    self.assertTrue(self.host.blocked)
+                    self.assertIn("meta skuid 104 tcp dport 22 drop", "".join(
+                        script or "" for argv, script in self.host.calls if argv[1:] == ["-f", "-"]))
+                    self.assertFalse(firewall.active)
+                    self.assertEqual(self.store.get(created["id"])["status"], "revoked")
+                    with self.assertRaises(ProtocolError):
+                        await asyncio.wait_for(command, timeout=3)
+                    self.assertTrue(self.host.units["deadbolt-bot.service"])
+                    self.assertTrue(self.host.units["alloy.service"])
 
         asyncio.run(exercise())
 
@@ -260,6 +351,15 @@ class EmergencyTests(unittest.TestCase):
         self.assertFalse(any(text == "delete table inet deadbolt_killswitch\n"
                              for _, text in self.host.calls))
 
+    def test_existing_emergency_table_gains_broker_block(self) -> None:
+        self.dispatch("emergency_stop")
+        self.host.broker_uid = 104
+        action = EmergencyAction(102, self.host, broker_uid=104)
+        self.assertFalse(action.enabled())
+        action.install_block()
+        self.assertTrue(action.enabled())
+        self.assertTrue(self.host.broker_installed)
+
     def test_restart_reenforces_stop_without_auto_recovery(self) -> None:
         self.dispatch("emergency_stop")
         self.host.blocked = False  # nftables runtime rules vanished after reboot.
@@ -286,17 +386,24 @@ class EmergencyTests(unittest.TestCase):
 
     def test_boot_restore_reenforces_before_executor_starts(self) -> None:
         from deadbolt.emergency_restore import restore
+        from tests.test_access import profile
         self.dispatch("emergency_stop")
         self.host.blocked = False
+        self.host.broker_uid = 104
         self.host.units["hermes-tls-proxy.service"] = True
         with (patch("deadbolt.emergency_restore.os.geteuid", return_value=0),
               patch("deadbolt.emergency_restore._secure_root_path"),
+              patch("deadbolt.emergency_restore.Policy.load",
+                    return_value=Policy({}, access_profiles={"ssh-session": profile()})),
               patch("deadbolt.emergency_restore.pwd.getpwnam",
-                    return_value=SimpleNamespace(pw_uid=102)),
+                    side_effect=lambda name: SimpleNamespace(pw_uid={
+                        "hermes": 102, "deadbolt-ssh": 104}[name])),
               patch("deadbolt.emergency_restore.EmergencyAction",
-                    return_value=EmergencyAction(102, self.host))):
+                    side_effect=lambda uid, broker_uid=None:
+                        EmergencyAction(uid, self.host, broker_uid=broker_uid))):
             restore(self.config)
         self.assertTrue(self.host.blocked)
+        self.assertTrue(EmergencyAction(102, self.host, broker_uid=104).enabled())
         self.assertFalse(self.host.units["hermes-tls-proxy.service"])
         self.assertIn("emergency_boot_reenforced", (self.base / "audit.jsonl").read_text())
 

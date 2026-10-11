@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ipaddress
+import hashlib
 import json
 import re
 import socket
@@ -63,7 +64,7 @@ def purpose(value: object) -> str:
     return value
 
 
-def command_argv(value: object) -> list[str]:
+def command_argv(value: object, *, allow_sensitive: bool = False) -> list[str]:
     if not isinstance(value, list) or not 1 <= len(value) <= MAX_ARGC:
         raise AccessError("command must be a bounded argv array")
     total = 0
@@ -71,7 +72,8 @@ def command_argv(value: object) -> list[str]:
         if (not isinstance(item, str) or not item or not item.isascii()
                 or len(item.encode()) > MAX_ARG_BYTES
                 or any(ord(c) < 32 or ord(c) > 126 for c in item)
-                or SENSITIVE.search(item) or SHELL_META.search(item) or "://" in item):
+                or (not allow_sensitive and (SENSITIVE.search(item) or "://" in item))
+                or SHELL_META.search(item)):
             raise AccessError("invalid or sensitive command argument")
         total += len(item.encode())
     if total > MAX_COMMAND_BYTES or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", value[0]):
@@ -167,7 +169,7 @@ class AccessProfile:
         audit_output = raw.get("audit_output", "metadata")
         if type(maximum) is not int or not 1 <= maximum <= 100:
             raise AccessError("SSH profile requires a command limit from 1 to 100")
-        if audit_output not in ("metadata", "redacted"):
+        if audit_output not in ("metadata", "full"):
             raise AccessError("invalid SSH output audit mode")
         if any(port in (80, 443) for port in ports):
             raise AccessError("baseline HTTP/HTTPS ports cannot be approval profiles")
@@ -222,7 +224,7 @@ def canonical_access(profile: AccessProfile, target: object, why: object, ttl: o
         raise AccessError("resolution requires too many exact firewall rules")
     if len(addresses) != 1:
         raise AccessError("SSH execution requires one unambiguous pinned IP")
-    command = command_argv(argv)
+    command = command_argv(argv, allow_sensitive=profile.audit_output == "full")
     if command[0] not in profile.remote_commands:
         raise AccessError("command is not in the root-owned SSH allow-list")
     safe_purpose = purpose(why)
@@ -239,12 +241,19 @@ def canonical_access(profile: AccessProfile, target: object, why: object, ttl: o
 
 def describe_access(record: dict[str, object]) -> str:
     command = record["initial_command"]
-    summary = json.dumps(command, ensure_ascii=True, separators=(",", ":"))
+    summary = command_summary(command)
     return (f"Parameterized access profile: {record['profile']}\n"
             f"Destination: {record['destination']}\n"
             f"Resolved pinned IPs: {', '.join(record['pinned_ips'])}\n"
             f"Protocol: {record['protocol']}\nPorts: {', '.join(map(str, record['ports']))}\n"
             f"SSH user: {record['ssh_user']}\nActive TTL: {record['ttl_seconds']} seconds\n"
             f"Command limit: {record['max_commands']}\nPurpose: {record['purpose']}\n"
-            f"First structured argv: {summary}\nFurther allowed commands need no new approval. "
+            f"First command: {summary['name']} ({summary['argument_count']} arguments; "
+            f"argv SHA-256: {summary['argv_sha256']})\nFurther allowed commands need no new approval. "
             "Each is validated and audited separately.")
+
+
+def command_summary(argv: list[str]) -> dict[str, object]:
+    return {"name": argv[0], "argument_count": len(argv) - 1,
+            "argv_sha256": hashlib.sha256(json.dumps(argv, ensure_ascii=True,
+                separators=(",", ":")).encode()).hexdigest()}

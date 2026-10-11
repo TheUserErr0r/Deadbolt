@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -11,6 +13,7 @@ import selectors
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from typing import Any, Callable
@@ -18,8 +21,8 @@ from typing import Any, Callable
 from deadbolt.access import AccessError, SENSITIVE, command_argv
 
 
-MAX_OUTPUT_BYTES = 4096
-MAX_ROOT_RESULT_BYTES = 12288
+MAX_OUTPUT_BYTES = 65536  # Per stdout/stderr stream; excess is drained and flagged.
+MAX_ROOT_RESULT_BYTES = 262144
 MAX_EXECUTION_SECONDS = 60
 REMOTE_RECEIVER = "/usr/local/libexec/deadbolt-remote-exec"
 
@@ -100,6 +103,90 @@ def _bounded_run(argv: list[str], payload: bytes, timeout: float,
                 stream.close()
 
 
+@dataclass(frozen=True)
+class CaptureResult:
+    exit_code: int | None
+    stdout: bytes
+    stderr: bytes
+    stdout_truncated: bool
+    stderr_truncated: bool
+    timed_out: bool
+
+
+def _capture_run(argv: list[str], payload: bytes, timeout: float) -> CaptureResult:
+    """Capture exact bytes up to MAX_OUTPUT_BYTES per stream and keep draining."""
+    process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, shell=False, close_fds=True,
+                               env={"PATH": "/usr/bin:/bin", "LANG": "C"})
+    assert process.stdin and process.stdout and process.stderr
+    deadline = time.monotonic() + timeout
+    stdout_fd, stderr_fd = process.stdout.fileno(), process.stderr.fileno()
+    output = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+    truncated = {stdout_fd: False, stderr_fd: False}
+    data = memoryview(payload)
+    selector = selectors.DefaultSelector()
+    timed_out = False
+    def append_chunk(fd: int, chunk: bytes) -> None:
+        remaining_bytes = MAX_OUTPUT_BYTES - len(output[fd])
+        output[fd].extend(chunk[:remaining_bytes])
+        if len(chunk) > remaining_bytes:
+            truncated[fd] = True
+
+    try:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            os.set_blocking(stream.fileno(), False)
+        selector.register(process.stdin, selectors.EVENT_WRITE)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(process.stderr, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            for key, _events in selector.select(remaining):
+                if key.fileobj is process.stdin:
+                    try:
+                        written = os.write(process.stdin.fileno(), data[:4096]) if data else 0
+                    except BrokenPipeError:
+                        written = 0
+                    data = data[written:]
+                    if not data or not written:
+                        selector.unregister(process.stdin)
+                        process.stdin.close()
+                else:
+                    chunk = os.read(key.fd, 4096)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    append_chunk(key.fd, chunk)
+        if not timed_out:
+            try:
+                code = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        if timed_out:
+            process.kill()
+            process.wait()
+            for stream in (process.stdout, process.stderr):
+                if stream.closed:
+                    continue
+                while chunk := os.read(stream.fileno(), 4096):
+                    append_chunk(stream.fileno(), chunk)
+            code = None
+        return CaptureResult(code, bytes(output[stdout_fd]), bytes(output[stderr_fd]),
+                             truncated[stdout_fd], truncated[stderr_fd], timed_out)
+    except Exception:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream and not stream.closed:
+                stream.close()
+
+
 Runner = Callable[[list[str], bytes, float], tuple[int, str, str]]
 
 
@@ -114,7 +201,7 @@ def _ssh_argv(record: dict[str, Any]) -> list[str]:
             "--", record["pinned_ip"], REMOTE_RECEIVER]
 
 
-def run_child(record: dict[str, Any], runner: Callable[..., tuple[int, str, str]] = _bounded_run,
+def run_child(record: dict[str, Any], runner: Callable[..., CaptureResult] = _capture_run,
               now: Callable[[], float] = time.time) -> dict[str, Any]:
     required = {"version", "request_id", "approval_id", "command_index", "destination",
                 "pinned_ip", "ssh_user", "ssh_key", "known_hosts", "argv", "audit_output",
@@ -128,9 +215,10 @@ def run_child(record: dict[str, Any], runner: Callable[..., tuple[int, str, str]
                     broker_gid=identity.pw_gid, private=True)
     _safe_root_file(record["known_hosts"], broker_uid=identity.pw_uid,
                     broker_gid=identity.pw_gid, private=False)
-    command = command_argv(record["argv"])
-    if (record["audit_output"] not in ("metadata", "redacted")
-            or type(record["command_index"]) is not int or record["command_index"] < 1
+    if record["audit_output"] not in ("metadata", "full"):
+        raise AccessError("invalid broker audit mode")
+    command = command_argv(record["argv"], allow_sensitive=record["audit_output"] == "full")
+    if (type(record["command_index"]) is not int or record["command_index"] < 1
             or type(record["timeout_seconds"]) is not int
             or not 1 <= record["timeout_seconds"] <= MAX_EXECUTION_SECONDS
             or type(record["expires_at"]) not in (int, float)
@@ -138,17 +226,22 @@ def run_child(record: dict[str, Any], runner: Callable[..., tuple[int, str, str]
         raise AccessError("expired or invalid broker command")
     started = now()
     payload = (json.dumps({"version": 1, "argv": command}, separators=(",", ":")) + "\n").encode()
-    code, stdout, stderr = runner(_ssh_argv(record), payload,
-                                   min(record["timeout_seconds"], record["expires_at"] - started))
+    captured = runner(_ssh_argv(record), payload,
+                      min(record["timeout_seconds"], record["expires_at"] - started))
     mode = record["audit_output"]
+    termination = ("timeout" if captured.timed_out else "signal"
+                   if captured.exit_code is not None and captured.exit_code < 0 else "exit")
     return {"request_id": record["request_id"], "approval_id": record["approval_id"],
             "command_index": record["command_index"], "started_at": started,
             "finished_at": now(), "destination": record["destination"],
             "pinned_ip": record["pinned_ip"], "ssh_user": record["ssh_user"],
-            "command": [redact(part) for part in command], "exit_code": code,
-            "audit_output": mode,
-            "stdout": redact(stdout)[:MAX_OUTPUT_BYTES] if mode == "redacted" else None,
-            "stderr": redact(stderr)[:MAX_OUTPUT_BYTES] if mode == "redacted" else None}
+            "command": command if mode == "full" else [redact(part) for part in command],
+            "exit_code": captured.exit_code, "termination": termination,
+            "timed_out": captured.timed_out, "audit_output": mode,
+            "stdout_b64": base64.b64encode(captured.stdout).decode("ascii") if mode == "full" else None,
+            "stderr_b64": base64.b64encode(captured.stderr).decode("ascii") if mode == "full" else None,
+            "stdout_truncated": captured.stdout_truncated,
+            "stderr_truncated": captured.stderr_truncated}
 
 
 class SystemdSSHExecutor:
@@ -160,11 +253,42 @@ class SystemdSSHExecutor:
         self.credential_dir = credential_dir
         self.runner = runner
         self.owner_uid = owner_uid
+        self._cancellations: dict[str, threading.Event] = {}
+        self._cancellation_lock = threading.Lock()
+
+    @staticmethod
+    def _unit(request_id: str, command_index: int) -> str:
+        try:
+            valid = str(uuid.UUID(request_id)) == request_id
+        except (TypeError, ValueError, AttributeError):
+            valid = False
+        if not valid or type(command_index) is not int or command_index < 1:
+            raise AccessError("invalid SSH unit identity")
+        return f"deadbolt-ssh-{request_id}-{command_index}.service"
+
+    def cancel(self, request_id: str, command_index: int) -> None:
+        """Preempt a known transient unit; safe before the worker starts it."""
+        unit = self._unit(request_id, command_index)
+        with self._cancellation_lock:
+            event = self._cancellations.setdefault(unit, threading.Event())
+            event.set()
+        try:
+            subprocess.run(["/usr/bin/systemctl", "stop", unit], shell=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10, check=False)
+            state = subprocess.run(["/usr/bin/systemctl", "show", "--property=ActiveState",
+                                    "--value", unit], shell=False, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AccessError("SSH unit cancellation failed") from exc
+        if state.returncode or state.stdout.strip() not in ("inactive", "failed"):
+            raise AccessError("SSH unit remained active after cancellation")
 
     def execute(self, canonical: dict[str, Any], request_id: str, approval_id: str,
                 command_index: int, argv: list[str], active_until: float,
                 now: float) -> dict[str, Any]:
-        command = command_argv(argv)
+        command = command_argv(argv, allow_sensitive=canonical["audit_output"] == "full")
         if command[0] not in canonical["remote_commands"]:
             raise AccessError("command is outside the root-owned receiver allow-list")
         if now >= active_until or canonical["protocol"] != "tcp" or canonical["ports"] != [22]:
@@ -201,7 +325,12 @@ class SystemdSSHExecutor:
             os.fsync(fd)
         finally:
             os.close(fd)
-        unit = f"deadbolt-ssh-{request_id}-{command_index}.service"
+        unit = self._unit(request_id, command_index)
+        with self._cancellation_lock:
+            cancelled = self._cancellations.setdefault(unit, threading.Event())
+        if cancelled.is_set():
+            path.unlink(missing_ok=True)
+            raise AccessError("SSH command was cancelled")
         address = canonical["pinned_ips"][0]
         prefix = "128" if ":" in address else "32"
         properties = ["User=deadbolt-ssh", "Group=deadbolt-ssh", "NoNewPrivileges=yes",
@@ -218,10 +347,16 @@ class SystemdSSHExecutor:
                         f"--unit={unit}", *(f"--property={item}" for item in properties),
                         "/opt/deadbolt/venv/bin/deadbolt-ssh-child"]
         try:
+            if cancelled.is_set():
+                raise AccessError("SSH command was cancelled")
             status, stdout, _stderr = self.runner(command_line, b"", limit + 10,
                                                    MAX_ROOT_RESULT_BYTES)
         finally:
             path.unlink(missing_ok=True)
+            with self._cancellation_lock:
+                self._cancellations.pop(unit, None)
+        if cancelled.is_set():
+            raise AccessError("SSH command was cancelled")
         if status != 0 or stdout.count("\n") != 1 or len(stdout) > MAX_ROOT_RESULT_BYTES:
             raise AccessError("broker unit failed or returned invalid result")
         try:
@@ -230,27 +365,41 @@ class SystemdSSHExecutor:
             raise AccessError("invalid broker unit result") from exc
         if (not isinstance(result, dict) or set(result) != {"request_id", "approval_id", "command_index",
                 "started_at", "finished_at", "destination", "pinned_ip", "ssh_user", "command",
-                "exit_code", "audit_output", "stdout", "stderr"}
+                "exit_code", "termination", "timed_out", "audit_output", "stdout_b64",
+                "stderr_b64", "stdout_truncated", "stderr_truncated"}
                 or result["request_id"] != request_id or result["approval_id"] != approval_id
                 or result["command_index"] != command_index or result["pinned_ip"] != address
                 or result["destination"] != canonical["destination"]
                 or result["ssh_user"] != canonical["ssh_user"]
                 or result["audit_output"] != canonical["audit_output"]
-                or result["command"] != [redact(part) for part in command]
-                or type(result["exit_code"]) is not int
+                or result["command"] != (command if canonical["audit_output"] == "full"
+                    else [redact(part) for part in command])
+                or type(result["timed_out"]) is not bool
+                or type(result["stdout_truncated"]) is not bool
+                or type(result["stderr_truncated"]) is not bool
+                or result["termination"] not in ("exit", "signal", "timeout")
+                or (result["exit_code"] is None) != result["timed_out"]
+                or (result["exit_code"] is not None and type(result["exit_code"]) is not int)
+                or (result["timed_out"] != (result["termination"] == "timeout"))
+                or (not result["timed_out"] and result["termination"] !=
+                    ("signal" if result["exit_code"] < 0 else "exit"))
                 or type(result["started_at"]) not in (int, float)
                 or type(result["finished_at"]) not in (int, float)
                 or not now - 2 <= result["started_at"] <= result["finished_at"] <= active_until + 2):
             raise AccessError("broker unit result does not match approved command")
-        if canonical["audit_output"] == "metadata" and (result["stdout"] is not None or result["stderr"] is not None):
+        if canonical["audit_output"] == "metadata" and (result["stdout_b64"] is not None
+                or result["stderr_b64"] is not None):
             raise AccessError("broker returned output despite metadata-only policy")
-        if canonical["audit_output"] == "redacted" and (not isinstance(result["stdout"], str)
-                or not isinstance(result["stderr"], str)
-                or len(result["stdout"]) > MAX_OUTPUT_BYTES or len(result["stderr"]) > MAX_OUTPUT_BYTES):
-            raise AccessError("broker output exceeds policy")
-        if canonical["audit_output"] == "redacted":
-            result["stdout"] = redact(result["stdout"])
-            result["stderr"] = redact(result["stderr"])
+        if canonical["audit_output"] == "full":
+            for field in ("stdout_b64", "stderr_b64"):
+                if not isinstance(result[field], str):
+                    raise AccessError("broker output violates full evidence contract")
+                try:
+                    size = len(base64.b64decode(result[field], validate=True))
+                except (ValueError, base64.binascii.Error) as exc:
+                    raise AccessError("invalid broker output encoding") from exc
+                if size > MAX_OUTPUT_BYTES:
+                    raise AccessError("broker output exceeds policy")
         return result
 
 
