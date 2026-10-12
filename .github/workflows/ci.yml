@@ -70,3 +70,4 @@ jobs:
       - run: docker run --rm --network none --cap-add NET_ADMIN deadbolt-ufw-ci python3 /app/nft_live.py
       - run: docker run --rm --network none --cap-add NET_ADMIN deadbolt-ufw-ci python3 /app/broker_live.py
       - run: docker run --rm --network none --cap-add NET_ADMIN deadbolt-ufw-ci python3 /app/outbound_live.py
+      - run: docker run --rm --network none --cap-add NET_ADMIN deadbolt-ufw-ci python3 /app/raw_connection_live.py

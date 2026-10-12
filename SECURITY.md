@@ -23,11 +23,15 @@ chunk to a private, fsynced local spool before forwarding. Spool exhaustion,
 write failure, revoked grant, or expiry terminates the session. Argus needs a
 separate root-only transcript receiver and restricted Loki tenant; ordinary
 audit/Discord never receive transcript bytes. Raw access has no content
-inspection. Raw TCP/22 can deliberately bypass SSH recording only after a
+inspection. Non-TCP/22 raw grants use a timed nft element ahead of a persistent
+exact-endpoint drop, so UFW's established-connection accept cannot extend a
+revoked or expired raw grant. The guard does not prevent SSH on other ports,
+including baseline-open public TCP/443. Raw TCP/22 can deliberately bypass SSH recording only after a
 prominent card warning and explicit operator confirmation. These features
 are disabled until a deliberate host migration removes existing static SSH
 exceptions and proves the restricted evidence path. The isolated tests cannot
-prove those live deployment properties.
+prove those live deployment properties; a five-minute Hermes-to-SysReptor-to-Argus
+acceptance test is still required.
 
 Only named root-owned UFW profiles, specifically enabled body-capture actions, and configured managed SSH profiles can be applied. Hermes cannot supply raw firewall rule fields, ports, service units, or shell commands. In a managed SSH profile, Hermes supplies a bounded destination, purpose, TTL, and structured argv; root resolves and pins the IP, and the target receiver runs only root-configured command wrappers. The Teleport and service action interfaces fail closed. UFW output is text rather than a transactional machine API; Deadbolt refuses ambiguous matching rules and records rollback failures for operator attention. An external administrator changing UFW concurrently can still create a narrow race around a CLI operation. Keep profile scopes narrow and review existing firewall rules before deployment.
 

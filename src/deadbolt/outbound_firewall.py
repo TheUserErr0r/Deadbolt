@@ -63,6 +63,22 @@ class ExactEgress:
 
     def ensure_guard(self) -> None:
         text = self._nft("-a", "list", "table", "inet", self.TABLE, missing_ok=True)
+        raw_sets = []
+        raw_rules = []
+        for family, address in ((4, "ip"), (6, "ip6")):
+            for transport in ("tcp", "udp"):
+                stem = f"raw_{transport}{family}"
+                address_type = f"ipv{family}_addr"
+                raw_sets.extend((
+                    f"add set inet {self.TABLE} {stem}_active {{ type {address_type} . inet_service; flags timeout; }}\n",
+                    f"add set inet {self.TABLE} {stem}_managed {{ type {address_type} . inet_service; }}\n"))
+                raw_rules.extend((
+                    f'add rule inet {self.TABLE} {self.CHAIN} meta skuid {self.hermes_uid} '
+                    f'{address} daddr . {transport} dport @{stem}_active accept '
+                    f'comment "deadbolt-hermes-{stem}-allow"\n',
+                    f'add rule inet {self.TABLE} {self.CHAIN} meta skuid {self.hermes_uid} '
+                    f'{address} daddr . {transport} dport @{stem}_managed drop '
+                    f'comment "deadbolt-hermes-{stem}-deny"\n'))
         if text is None:
             uid = self.proxy_uid
             script = (f"add table inet {self.TABLE}\n"
@@ -71,6 +87,7 @@ class ExactEgress:
                       f"add set inet {self.TABLE} raw22_4 {{ type ipv4_addr; flags timeout; }}\n"
                       f"add set inet {self.TABLE} raw22_6 {{ type ipv6_addr; flags timeout; }}\n"
                       f"add chain inet {self.TABLE} {self.CHAIN} {{ type filter hook output priority -151; policy accept; }}\n"
+                      + "".join(raw_sets) + "".join(raw_rules) +
                       f"add rule inet {self.TABLE} {self.CHAIN} meta skuid {self.hermes_uid} ip daddr @raw22_4 tcp dport 22 accept comment \"deadbolt-hermes-raw22-allow4\"\n"
                       f"add rule inet {self.TABLE} {self.CHAIN} meta skuid {self.hermes_uid} ip6 daddr @raw22_6 tcp dport 22 accept comment \"deadbolt-hermes-raw22-allow6\"\n"
                       f"add rule inet {self.TABLE} {self.CHAIN} meta skuid {self.hermes_uid} tcp dport 22 drop comment \"deadbolt-hermes-ssh-deny\"\n"
@@ -81,7 +98,9 @@ class ExactEgress:
             self._nft("-f", "-", data=script)
             text = self._nft("-a", "list", "table", "inet", self.TABLE)
         assert text is not None
-        expected = [f'meta skuid {self.hermes_uid} ip daddr @raw22_4 tcp dport 22 accept comment "deadbolt-hermes-raw22-allow4"',
+        expected = [rule.removeprefix(f"add rule inet {self.TABLE} {self.CHAIN} ").strip()
+                    for rule in raw_rules]
+        expected += [f'meta skuid {self.hermes_uid} ip daddr @raw22_4 tcp dport 22 accept comment "deadbolt-hermes-raw22-allow4"',
                     f'meta skuid {self.hermes_uid} ip6 daddr @raw22_6 tcp dport 22 accept comment "deadbolt-hermes-raw22-allow6"',
                     f'meta skuid {self.hermes_uid} tcp dport 22 drop comment "deadbolt-hermes-ssh-deny"',
                     f'meta skuid {self.proxy_uid} oifname "lo" accept comment "deadbolt-proxy-loopback"',
@@ -90,6 +109,9 @@ class ExactEgress:
                     f'meta skuid {self.proxy_uid} drop comment "deadbolt-proxy-deny"']
         if (not re.search(r"type filter hook output priority (?:-151|mangle - 1); policy accept;", text)
                 or "set raw22_4" not in text or "set raw22_6" not in text
+                or any(f"set raw_{transport}{family}_{suffix}" not in text
+                       for family in (4, 6) for transport in ("tcp", "udp")
+                       for suffix in ("active", "managed"))
                 or any(text.count(line) != 1 for line in expected)
                 or [text.index(line) for line in expected] != sorted(text.index(line) for line in expected)):
             raise OutboundFirewallError("SSH proxy nft guard is missing or changed")
@@ -177,6 +199,17 @@ class ExactEgress:
             raise OutboundFirewallError("raw SSH nft grant belongs to another request")
         return True
 
+    def _raw_element(self, ip: str, port: int, transport: str, tag: str | None) -> bool:
+        stem = f"raw_{transport}{ipaddress.ip_address(ip).version}"
+        name = f"{stem}_{'active' if tag is not None else 'managed'}"
+        text = self._nft("get", "element", "inet", self.TABLE, name,
+                         "{", ip, ".", str(port), "}", missing_ok=True)
+        if text is None:
+            return False
+        if tag is not None and f'comment "{tag}"' not in text:
+            raise OutboundFirewallError("raw nft grant belongs to another request")
+        return True
+
     def ensure_grant(self, kind: str, ip: str, port: int, transport: str,
                      request_id: str, expiry: int, now: float) -> dict[str, object]:
         if kind not in ("ssh", "raw") or (kind == "ssh" and transport != "tcp"):
@@ -197,6 +230,16 @@ class ExactEgress:
             remaining = max(1, int(expiry - now))
             self._nft("add", "element", "inet", self.TABLE, name, "{", ip,
                       "timeout", f"{remaining}s", "comment", f'"{tag}"', "}")
+        if kind == "raw" and not (transport == "tcp" and port == 22):
+            stem = f"raw_{transport}{ipaddress.ip_address(ip).version}"
+            if not self._raw_element(ip, port, transport, None):
+                self._nft("add", "element", "inet", self.TABLE, f"{stem}_managed",
+                          "{", ip, ".", str(port), "}")
+            if not self._raw_element(ip, port, transport, tag):
+                remaining = max(1, int(expiry - now))
+                self._nft("add", "element", "inet", self.TABLE, f"{stem}_active",
+                          "{", ip, ".", str(port), "timeout", f"{remaining}s",
+                          "comment", f'"{tag}"', "}")
         if self._iptables(ip, "-C", chain, *rule, missing_ok=True) is None:
             self._iptables(ip, "-I", chain, "1", *rule)
         elif not self._before_deny(ip, chain, tag, port, transport,
@@ -219,7 +262,10 @@ class ExactEgress:
                                          self.proxy_uid if kind == "ssh" else self.hermes_uid)
                 or kind == "ssh" and not self._element(ip, port, tag)
                 or kind == "raw" and transport == "tcp" and port == 22
-                   and not self._raw22_element(ip, tag)):
+                   and not self._raw22_element(ip, tag)
+                or kind == "raw" and not (transport == "tcp" and port == 22)
+                   and (not self._raw_element(ip, port, transport, None)
+                        or not self._raw_element(ip, port, transport, tag))):
             raise OutboundFirewallError("exact UID grant is absent or behind a UFW deny")
 
     def revoke(self, kind: str, ip: str, port: int, transport: str,
@@ -242,6 +288,14 @@ class ExactEgress:
                     self._nft("delete", "element", "inet", self.TABLE, name, "{", ip, "}")
             except OutboundFirewallError:
                 failed = True
+        if kind == "raw" and not (transport == "tcp" and port == 22):
+            stem = f"raw_{transport}{ipaddress.ip_address(ip).version}"
+            try:
+                if self._raw_element(ip, port, transport, tag):
+                    self._nft("delete", "element", "inet", self.TABLE, f"{stem}_active",
+                              "{", ip, ".", str(port), "}")
+            except OutboundFirewallError:
+                failed = True
         chain = self._chain(kind, port, transport)
         rule = self._rule(kind, ip, port, transport, expiry, tag)
         try:
@@ -252,5 +306,8 @@ class ExactEgress:
         if (failed or self._iptables(ip, "-C", chain, *rule, missing_ok=True) is not None
                 or kind == "ssh" and self._element(ip, port, tag)
                 or kind == "raw" and transport == "tcp" and port == 22
-                   and self._raw22_element(ip, tag)):
+                   and self._raw22_element(ip, tag)
+                or kind == "raw" and not (transport == "tcp" and port == 22)
+                   and (self._raw_element(ip, port, transport, tag)
+                        or not self._raw_element(ip, port, transport, None))):
             raise OutboundFirewallError("exact outbound grant remains after revoke")

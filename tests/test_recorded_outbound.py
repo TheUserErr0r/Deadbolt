@@ -12,6 +12,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import deadbolt.ssh_transcript as transcript_module
 from deadbolt.outbound import OutboundError, OutboundPolicy, canonical_outbound, describe_outbound
 from deadbolt.outbound_firewall import ExactEgress, OutboundFirewallError
 from deadbolt.ssh_transcript import EvidenceError, TranscriptSpool, recover_orphans
@@ -72,8 +73,19 @@ class FirewallTests(unittest.TestCase):
         rid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         state = {"ufw": False, "before": False, "nft": False}
         calls = []
+        raw_sets = " ".join(f"set raw_{transport}{family}_{suffix} {{ }}"
+                            for family in (4, 6) for transport in ("tcp", "udp")
+                            for suffix in ("active", "managed"))
+        raw_rules = "\n".join(
+            f'meta skuid 1001 {address} daddr . {transport} dport @raw_{transport}{family}_{suffix} '
+            f'{verdict} comment "deadbolt-hermes-raw_{transport}{family}-{label}"'
+            for family, address in ((4, "ip"), (6, "ip6"))
+            for transport in ("tcp", "udp")
+            for suffix, verdict, label in (("active", "accept", "allow"),
+                                           ("managed", "drop", "deny")))
         guard = ('type filter hook output priority -151; policy accept;\n'
-                 'set raw22_4 { } set raw22_6 { }\n'
+                 f'set raw22_4 {{ }} set raw22_6 {{ }} {raw_sets}\n'
+                 f'{raw_rules}\n'
                  'meta skuid 1001 ip daddr @raw22_4 tcp dport 22 accept comment "deadbolt-hermes-raw22-allow4"\n'
                  'meta skuid 1001 ip6 daddr @raw22_6 tcp dport 22 accept comment "deadbolt-hermes-raw22-allow6"\n'
                  'meta skuid 1001 tcp dport 22 drop comment "deadbolt-hermes-ssh-deny"\n'
@@ -159,12 +171,115 @@ class TranscriptTests(unittest.TestCase):
                 with self.assertRaises(EvidenceError):
                     item.record("stdout", b"must not be forwarded")
             os.close(item.fd)
-            # A hard crash leaves no completed manifest; the next proxy start
+            # A hard crash leaves no completed manifest; independent recovery
             # marks the transcript interrupted rather than pretending success.
             recovered = recover_orphans(root)
             self.assertEqual(recovered, 1)
             manifest = json.loads((item.path / "manifest.json").read_text())
             self.assertTrue(manifest["output_incomplete"])
+
+    def test_normal_finish_keeps_writer_lock_until_manifest_is_durable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            item = TranscriptSpool(root, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                                   "192.168.1.205", 22, "reptor")
+            real_commit = transcript_module._commit_manifest
+            def commit_while_exporter_checks(*args):
+                self.assertEqual(recover_orphans(root), 0)
+                self.assertFalse((item.path / "manifest.json").exists())
+                real_commit(*args)
+            with patch("deadbolt.ssh_transcript._commit_manifest",
+                       side_effect=commit_while_exporter_checks):
+                item.finish()
+            manifest = json.loads((item.path / "manifest.json").read_text())
+            self.assertEqual(manifest["reason"], "complete")
+            self.assertNotIn("output_incomplete", manifest)
+
+    def test_exporter_recovers_crash_and_delivers_without_another_grant(self):
+        with tempfile.TemporaryDirectory() as spool_temp, tempfile.TemporaryDirectory() as argus_temp:
+            spool = Path(spool_temp)
+            argus = Path(argus_temp)
+            spool.chmod(0o700)
+            argus.chmod(0o700)
+            rid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            item = TranscriptSpool(spool, rid, "192.168.1.205", 22, "reptor")
+            item.record("stdout", b"crash-visible output\n")
+            receiver = ArgusReceiver(argus, "http://127.0.0.1:13100/loki/api/v1/push", "restricted-test")
+            exporter = object.__new__(TranscriptExporter)
+            exporter.spool = spool
+            exporter.proxy_uid = os.geteuid()
+            exporter.host = "argus.test"
+            exporter.port = 8443
+            exporter.context = object()
+
+            class LokiResponse:
+                status = 204
+                def __enter__(self): return self
+                def __exit__(self, *args): return None
+
+            class Connection:
+                def __init__(self, *args, **kwargs):
+                    self.headers = {}
+                    self.data = bytearray()
+                def putrequest(self, *args): pass
+                def putheader(self, name, value): self.headers[name] = value
+                def endheaders(self): pass
+                def send(self, data): self.data.extend(data)
+                def getresponse(self):
+                    manifest = json.loads(base64.b64decode(self.headers["X-Deadbolt-Manifest"]))
+                    with patch("deadbolt.transcript_delivery.urllib.request.urlopen",
+                               return_value=LokiResponse()):
+                        ack = receiver.store(manifest["session_id"], bytes(self.data), manifest)
+                    return SimpleNamespace(status=200, read=lambda limit: json.dumps(ack).encode())
+                def close(self): pass
+
+            with patch("deadbolt.transcript_delivery.http.client.HTTPSConnection", Connection):
+                self.assertEqual(exporter.once(), (0, 0))
+                self.assertFalse((item.path / "manifest.json").exists(),
+                                 "exporter must not finalize a live writer")
+                os.close(item.fd)  # Simulate the proxy process dying without finish().
+                self.assertEqual(exporter.once(), (1, 0))
+            manifest = json.loads((argus / item.session_id / "manifest.json").read_text())
+            self.assertEqual(manifest["reason"], "proxy_crash")
+            self.assertTrue(manifest["output_incomplete"])
+            frames = [json.loads(line) for line in
+                      (argus / item.session_id / "frames.jsonl").read_text().splitlines()]
+            self.assertEqual(base64.b64decode(frames[1]["data_b64"]), b"crash-visible output\n")
+            self.assertTrue((item.path / "delivered.json").exists())
+
+    def test_partial_crash_frame_is_preserved_in_restricted_argus_evidence(self):
+        with tempfile.TemporaryDirectory() as spool_temp, tempfile.TemporaryDirectory() as argus_temp:
+            spool = Path(spool_temp)
+            argus = Path(argus_temp)
+            spool.chmod(0o700)
+            argus.chmod(0o700)
+            item = TranscriptSpool(spool, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                                   "192.168.1.205", 22, "reptor")
+            item.record("stdout", b"complete output")
+            tail = b'{"event":"stdout","data_b64":"unfinished'
+            os.write(item.fd, tail)
+            os.fsync(item.fd)
+            os.close(item.fd)
+            self.assertEqual(recover_orphans(spool), 1)
+            manifest = json.loads((item.path / "manifest.json").read_text())
+            self.assertEqual(manifest["reason"], "proxy_crash")
+            self.assertTrue(manifest["output_incomplete"])
+            self.assertTrue(manifest["partial_frame"])
+            body = (item.path / "frames.jsonl").read_bytes()
+            self.assertTrue(body.endswith(tail))
+            lines = _loki_lines(body, manifest)
+            self.assertIn('"event":"recovery_tail"', lines[-1][1])
+            self.assertIn("unfinished", lines[-1][1])
+            receiver = ArgusReceiver(argus, "http://127.0.0.1:13100/loki/api/v1/push", "restricted-test")
+            class LokiResponse:
+                status = 204
+                def __enter__(self): return self
+                def __exit__(self, *args): return None
+            with patch("deadbolt.transcript_delivery.urllib.request.urlopen",
+                       return_value=LokiResponse()):
+                receiver.store(item.session_id, body, manifest)
+            self.assertEqual((argus / item.session_id / "frames.jsonl").read_bytes(), body)
 
     def test_argus_ack_only_after_restricted_loki_accepts(self):
         with tempfile.TemporaryDirectory() as temp:

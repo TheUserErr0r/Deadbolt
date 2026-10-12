@@ -25,7 +25,7 @@ from typing import Any
 import urllib.request
 import uuid
 
-from deadbolt.ssh_transcript import EvidenceError, MAX_SESSION_BYTES, _write_all
+from deadbolt.ssh_transcript import EvidenceError, MAX_SESSION_BYTES, _write_all, recover_orphans
 
 
 LOG = logging.getLogger(__name__)
@@ -54,7 +54,8 @@ def _private_file(path: Path, owner_uid: int) -> None:
 
 def _validate_manifest(value: Any) -> dict[str, Any]:
     if (not isinstance(value, dict) or set(value) - {
-            "session_id", "request_id", "frame_count", "sha256", "finished_at", "reason", "output_incomplete"}
+            "session_id", "request_id", "frame_count", "sha256", "finished_at", "reason",
+            "output_incomplete", "partial_frame"}
             or not all(key in value for key in ("session_id", "request_id", "frame_count", "sha256"))):
         raise DeliveryError("invalid SSH evidence manifest")
     for key in ("session_id", "request_id"):
@@ -74,6 +75,11 @@ def _validate_manifest(value: Any) -> dict[str, Any]:
         raise DeliveryError("invalid SSH evidence completion reason")
     if "output_incomplete" in value and type(value["output_incomplete"]) is not bool:
         raise DeliveryError("invalid SSH evidence completion state")
+    if "partial_frame" in value and type(value["partial_frame"]) is not bool:
+        raise DeliveryError("invalid SSH evidence partial-frame state")
+    if value.get("partial_frame") and (value.get("reason") != "proxy_crash"
+                                       or value.get("output_incomplete") is not True):
+        raise DeliveryError("partial SSH evidence must be marked as a proxy crash")
     return value
 
 
@@ -159,6 +165,14 @@ class TranscriptExporter:
 
     def once(self) -> tuple[int, int]:
         _private_directory(self.spool, self.proxy_uid)
+        try:
+            recovered = recover_orphans(self.spool, owner_uid=self.proxy_uid)
+            if recovered:
+                LOG.warning("recovered %d crashed SSH transcript sessions for restricted delivery", recovered)
+        except EvidenceError:
+            # A malformed or partial frame remains on disk for inspection;
+            # complete sessions must still be delivered on this pass.
+            LOG.exception("crashed SSH transcript recovery needs inspection")
         delivered = 0
         pending = 0
         for directory in sorted(self.spool.iterdir()):
@@ -183,12 +197,28 @@ def _loki_lines(raw: bytes, manifest: dict[str, Any]) -> list[list[str]]:
     last_ns = 0
     last_event = None
     for sequence, payload in enumerate(raw.splitlines()):
-        frame = json.loads(payload)
+        try:
+            frame = json.loads(payload)
+        except ValueError:
+            if (sequence != manifest["frame_count"] - 1
+                    or not manifest.get("partial_frame")
+                    or not manifest.get("output_incomplete")):
+                raise DeliveryError("SSH transcript contains a malformed frame")
+            # The raw Argus file retains these exact bytes; the restricted
+            # searchable stream labels the final fragment explicitly.
+            frame = {"session_id": manifest["session_id"],
+                     "request_id": manifest["request_id"], "sequence": sequence,
+                     "timestamp": manifest["finished_at"], "event": "recovery_tail",
+                     "data_b64": base64.b64encode(payload).decode(),
+                     "metadata": {"partial_frame": True}}
         if (frame.get("session_id") != manifest["session_id"]
                 or frame.get("request_id") != manifest["request_id"]
                 or frame.get("sequence") != sequence
                 or frame.get("event") not in {"session_started", "stdin", "stdout", "stderr",
-                                              "exec_request", "session_finished", "session_failed"}
+                                              "exec_request", "session_finished", "session_failed",
+                                              "recovery_tail"}
+                or frame.get("event") == "recovery_tail" and
+                   (sequence != manifest["frame_count"] - 1 or not manifest.get("partial_frame"))
                 or sequence == 0 and frame.get("event") != "session_started"):
             raise DeliveryError("SSH transcript frame identity or order mismatch")
         last_event = frame["event"]

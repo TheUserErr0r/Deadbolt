@@ -74,7 +74,13 @@ output guard. It drops all direct `hermes` TCP/22 and all non-loopback proxy
 account egress except an active timed exact-IP:port set entry. An exact
 UID/destination/port UFW accept is inserted **before** the matching LAN or
 SSH deny, with its own UTC deadline. An nft accept alone cannot override a
-later UFW deny. The executor checks both layers on approval and every
+later UFW deny. Raw TCP/UDP grants other than TCP/22 also use an early timed
+nft allow followed by a persistent Deadbolt-owned exact-endpoint drop. When
+the timed element expires or is revoked, that drop precedes UFW's
+`ESTABLISHED` accept, so an open raw connection cannot keep sending. The
+owned drop entry remains until the nft table is deliberately recreated or
+the host reboots; a fresh approved grant to the same endpoint can activate
+it again. The executor checks both layers on approval and every
 reconciliation pass, including after UFW reload. The independent nft timeout
 and UFW time match stop permitting a packet after expiry even if Deadbolt is
 down; the executor removes owned rules on restart. Raw TCP/22 is a separate
@@ -83,8 +89,10 @@ exact Hermes-UID rule and never created by an `ssh` approval.
 At migration, remove the old Hermes UID and host-wide static SysReptor
 TCP/22 accepts from the controlled UFW chains. Do this as an explicit host
 change after reviewing the current rules; the PR does not remove them live.
-Verify that direct Hermes-to-target TCP/22 fails before, during, and after a
-proxied grant. Preserve the durable DNS, HTTP/HTTPS, Wazuh, and Loki baseline
+Verify that direct Hermes-to-target **TCP/22** fails before, during, and after a
+proxied grant. This is not an all-port SSH block: a target listening on
+baseline-open public TCP/443 may still be reachable outside the recording
+proxy. Preserve the durable DNS, HTTP/HTTPS, Wazuh, and Loki baseline
 rules. Emergency stop blocks Hermes and all proxy-account outbound traffic,
 revokes grants, and stops the proxy service while Deadbolt and Alloy continue.
 
@@ -95,8 +103,12 @@ The proxy writes per-session JSONL frames containing byte-exact base64 data
 and fsyncs each frame first. Frames include `session_started`, `exec_request`,
 `stdin`, `stdout`, `stderr`, and a completion/failure marker. A final manifest
 has the SHA-256 of all frames, frame count, request/session IDs, finish time,
-and reason. Crashed sessions are marked `proxy_crash` with
-`output_incomplete=true` on recovery. This is restricted evidence; it may
+and reason. The independently running exporter checks for unlocked orphan
+sessions on every pass, without requiring another grant or proxy startup.
+It marks them `proxy_crash` with `output_incomplete=true` and delivers their
+manifest to Argus. A partially written final frame stays byte-exact in the
+restricted Argus file and appears as a `recovery_tail` event in restricted
+Loki; the manifest marks `partial_frame=true`. This is restricted evidence; it may
 contain credentials. The ordinary Deadbolt audit, Discord, and Hermes status
 contain metadata only.
 
@@ -140,10 +152,12 @@ Do not enable SSH policy until this pipeline is configured and tested.
    exporter, and prove a manifest is ACKed only after the complete restricted
    transcript and searchable text arrive. Simulate Argus downtime and a full
    local spool; prove backlog/retry or refusal without dropped bytes.
-4. Remove the two static SysReptor SSH exceptions. Confirm direct Hermes SSH
-   fails. Approve a one-hour `ssh` grant, connect through the pinned loopback
-   proxy, run `id`, and read `/etc/os-release` interactively. Find the actual
-   commands and output on Argus by session ID. Confirm direct SSH still fails.
+4. Remove the two static SysReptor SSH exceptions. Confirm direct Hermes
+   TCP/22 fails. Approve a one-hour `ssh` grant and hold a live proxied
+   Hermes-to-SysReptor session for **five minutes**. Run `id` and read
+   `/etc/os-release` interactively. Find the actual input and output on Argus
+   by session ID, then confirm direct Hermes TCP/22 still fails during and
+   after the grant.
 5. Repeat with expiry, operator revoke, emergency stop, proxy failure,
    evidence-sink failure, UFW reload, and reboot. Verify no direct rule is
    added for `ssh`, that active sessions close, and that recovery requires a

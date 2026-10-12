@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -40,6 +41,28 @@ def _write_all(fd: int, data: bytes) -> None:
         remaining = remaining[n:]
 
 
+def _commit_manifest(directory: Path, manifest: dict[str, Any], owner: int) -> None:
+    """Publish a complete manifest while the session writer lock is held."""
+    temporary = directory / f".manifest-{uuid.uuid4()}.tmp"
+    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            if os.geteuid() != owner:
+                os.fchown(fd, owner, -1)
+            _write_all(fd, (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.link(temporary, directory / "manifest.json", follow_symlinks=False)
+    finally:
+        temporary.unlink(missing_ok=True)
+    directory_fd = os.open(directory, os.O_DIRECTORY | os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 class TranscriptSpool:
     def __init__(self, base: Path, request_id: str, destination: str, port: int,
                  ssh_user: str, *, session_id: str | None = None):
@@ -53,6 +76,13 @@ class TranscriptSpool:
         self.path.mkdir(mode=0o700)
         self.fd = os.open(self.path / "frames.jsonl",
                           os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        try:
+            # The exporter can distinguish a live writer from a crashed one
+            # without waiting for another proxy process to start.
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(self.fd)
+            raise EvidenceError("SSH evidence writer lock is unavailable") from exc
         self.digest = hashlib.sha256()
         self.count = 0
         self.bytes_written = 0
@@ -97,57 +127,81 @@ class TranscriptSpool:
         manifest = {"session_id": self.session_id, "request_id": self.request_id,
                     "frame_count": self.count, "sha256": self.digest.hexdigest(),
                     "finished_at": _utc(), "reason": reason}
-        os.close(self.fd)
-        self.closed = True
-        manifest_path = self.path / "manifest.json"
-        fd = os.open(manifest_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         try:
-            _write_all(fd, (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode())
-            os.fsync(fd)
+            _commit_manifest(self.path, manifest, os.geteuid())
         finally:
-            os.close(fd)
-        directory = os.open(self.path, os.O_DIRECTORY | os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+            os.close(self.fd)
+            self.closed = True
         return manifest
 
 
-def recover_orphans(base: Path) -> int:
-    """Complete sessions left open by a prior crashed proxy process."""
+def recover_orphans(base: Path, *, owner_uid: int | None = None) -> int:
+    """Complete unlocked sessions left by crashed proxies, even without a new grant."""
+    owner = os.geteuid() if owner_uid is None else owner_uid
+    info = base.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != owner or info.st_mode & 0o077:
+        raise EvidenceError("SSH evidence spool is not private")
     recovered = 0
+    first_error: EvidenceError | None = None
     for directory in base.iterdir():
-        if not directory.is_dir() or (directory / "manifest.json").exists():
-            continue
         try:
             session_id = str(uuid.UUID(directory.name))
         except ValueError:
             continue
         if session_id != directory.name:
             continue
-        frames = directory / "frames.jsonl"
-        if not frames.is_file():
+        try:
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != owner or info.st_mode & 0o077:
+                raise EvidenceError("crashed SSH transcript directory is unsafe")
+            if (directory / "manifest.json").exists():
+                continue
+            frames = directory / "frames.jsonl"
+            frame_info = frames.lstat()
+            if (not stat.S_ISREG(frame_info.st_mode) or frame_info.st_uid != owner
+                    or frame_info.st_mode & 0o077):
+                raise EvidenceError("crashed SSH transcript file is unsafe")
+            fd = os.open(frames, os.O_RDONLY | os.O_NOFOLLOW)
+        except (OSError, EvidenceError) as exc:
+            if first_error is None:
+                first_error = EvidenceError("crashed SSH transcript cannot be inspected")
+                first_error.__cause__ = exc
             continue
-        payload = frames.read_bytes()
-        if payload and not payload.endswith(b"\n"):
-            # An incomplete last frame must be surfaced, never hidden.
-            raise EvidenceError("crashed SSH transcript contains a partial frame")
-        lines = payload.splitlines()
-        if not lines:
-            raise EvidenceError("crashed SSH transcript has no start event")
         try:
-            first = json.loads(lines[0])
-        except ValueError as exc:
-            raise EvidenceError("crashed SSH transcript is malformed") from exc
-        manifest = {"session_id": session_id, "request_id": first["request_id"],
-                    "frame_count": len(lines), "sha256": hashlib.sha256(payload).hexdigest(),
-                    "finished_at": _utc(), "reason": "proxy_crash", "output_incomplete": True}
-        fd = os.open(directory / "manifest.json", os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-        try:
-            _write_all(fd, (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode())
-            os.fsync(fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue  # An active proxy still owns this session.
+            if (directory / "manifest.json").exists():
+                continue
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                payload = stream.read(MAX_SESSION_BYTES + 1)
+            if len(payload) > MAX_SESSION_BYTES:
+                raise EvidenceError("crashed SSH transcript exceeds its size limit")
+            partial_frame = bool(payload and not payload.endswith(b"\n"))
+            lines = payload.splitlines()
+            if not lines:
+                raise EvidenceError("crashed SSH transcript has no start event")
+            try:
+                first = json.loads(lines[0])
+                request_id = str(uuid.UUID(first["request_id"]))
+            except (ValueError, KeyError, TypeError) as exc:
+                raise EvidenceError("crashed SSH transcript is malformed") from exc
+            if (first.get("session_id") != session_id or first.get("event") != "session_started"
+                    or request_id != first["request_id"]):
+                raise EvidenceError("crashed SSH transcript start event is invalid")
+            manifest = {"session_id": session_id, "request_id": request_id,
+                        "frame_count": len(lines), "sha256": hashlib.sha256(payload).hexdigest(),
+                        "finished_at": _utc(), "reason": "proxy_crash",
+                        "output_incomplete": True, "partial_frame": partial_frame}
+            _commit_manifest(directory, manifest, owner)
+            recovered += 1
+        except (OSError, EvidenceError) as exc:
+            if first_error is None:
+                first_error = EvidenceError("crashed SSH transcript recovery failed")
+                first_error.__cause__ = exc
         finally:
             os.close(fd)
-        recovered += 1
+    if first_error is not None:
+        raise first_error
     return recovered
