@@ -9,6 +9,7 @@ import re
 import tomllib
 
 from deadbolt.access import AccessProfile, AccessError
+from deadbolt.outbound import OutboundPolicy, OutboundError
 
 
 NAME = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
@@ -87,12 +88,13 @@ class Policy:
     body_exclusion_allowed_hosts: tuple[str, ...] = ()
     emergency_workload_units: tuple[str, ...] = ()
     access_profiles: dict[str, AccessProfile] | None = None
+    outbound_access: OutboundPolicy = OutboundPolicy()
 
     @classmethod
     def load(cls, path: Path) -> Policy:
         with path.open("rb") as stream:
             raw = tomllib.load(stream)
-        if not set(raw) <= {"firewall_profiles", "access_profiles", "proxy_body_capture", "body_capture_exclusions", "emergency_stop"} or not isinstance(raw.get("firewall_profiles"), dict):
+        if not set(raw) <= {"firewall_profiles", "access_profiles", "proxy_body_capture", "body_capture_exclusions", "emergency_stop", "outbound_access"} or not isinstance(raw.get("firewall_profiles"), dict):
             raise ConfigurationError("profiles.toml requires [firewall_profiles]")
         capture = raw.get("proxy_body_capture", {"enabled": False})
         if not isinstance(capture, dict) or set(capture) != {"enabled"} or type(capture["enabled"]) is not bool:
@@ -111,10 +113,11 @@ class Policy:
         try:
             access = {name: AccessProfile.from_mapping(name, value)
                       for name, value in access_raw.items()}
-        except AccessError as exc:
+            outbound = OutboundPolicy.parse(raw.get("outbound_access"))
+        except (AccessError, OutboundError) as exc:
             raise ConfigurationError(str(exc)) from exc
         return cls({name: FirewallProfile.from_mapping(name, value)
-                    for name, value in raw["firewall_profiles"].items()}, capture["enabled"], allowed, units, access)
+                    for name, value in raw["firewall_profiles"].items()}, capture["enabled"], allowed, units, access, outbound)
 
 
 def normalize_hosts(value: object) -> tuple[str, ...]:

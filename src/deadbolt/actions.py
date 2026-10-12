@@ -5,6 +5,7 @@ from __future__ import annotations
 import shlex
 import json
 import hashlib
+import ipaddress
 import os
 from pathlib import Path
 import grp
@@ -70,8 +71,8 @@ class UfwAction:
             rule += [str(request["direction"]), "on", str(request["interface"])]
         elif request["direction"] == "out":
             rule += ["out"]
-        source = str(request["source"])
-        destination = str(request["destination"])
+        source = self._ufw_address(str(request["source"]))
+        destination = self._ufw_address(str(request["destination"]))
         if source not in ("any", "0.0.0.0/0", "::/0"):
             rule += ["from", source]
         if destination in ("0.0.0.0/0", "::/0"):
@@ -79,6 +80,15 @@ class UfwAction:
         rule += ["to", destination, "port", str(request["port"]),
                  "proto", str(request["protocol"])]
         return rule
+
+    @staticmethod
+    def _ufw_address(value: str) -> str:
+        """UFW emits /32 and /128 networks as bare addresses in `show added`."""
+        if value == "any":
+            return value
+        network = ipaddress.ip_network(value, strict=True)
+        return (str(network.network_address) if network.prefixlen == network.max_prefixlen
+                else value)
 
     def _run(self, args: list[str]) -> str:
         result = self.runner([self.executable, *args])
@@ -422,9 +432,10 @@ class EmergencyAction:
 
     def __init__(self, hermes_uid: int,
                  runner: Callable[[list[str], str | None], subprocess.CompletedProcess[str]] | None = None,
-                 *, broker_uid: int | None = None):
+                 *, broker_uid: int | None = None, proxy_uid: int | None = None):
         self.hermes_uid = hermes_uid
         self.broker_uid = broker_uid
+        self.proxy_uid = proxy_uid
         self.runner = runner or self._run_process
 
     @staticmethod
@@ -463,7 +474,7 @@ class EmergencyAction:
         if not found:
             return "absent"
         objects = self._objects(self._call(["/usr/sbin/nft", "-j", "list", "table", "inet", self.table]))
-        if [key for key, _ in objects[:2]] != ["table", "chain"] or len(objects) not in (3, 4):
+        if [key for key, _ in objects[:2]] != ["table", "chain"] or len(objects) not in (3, 4, 5):
             raise ActionError("emergency nftables table was changed externally")
         table, chain = (value for _, value in objects[:2])
         rules = [value for key, value in objects[2:] if key == "rule"]
@@ -480,20 +491,35 @@ class EmergencyAction:
                 or rule.get("table") != self.table or rule.get("chain") != self.chain
                 or rule.get("comment") != self.comment or rule.get("expr") != expression):
             raise ActionError("emergency nftables rule was changed externally")
-        if len(rules) == 2:
+        present = {rule.get("comment"): rule for rule in rules[1:]}
+        if len(present) != len(rules) - 1:
+            raise ActionError("emergency nftables rule was changed externally")
+        if "deadbolt:emergency-broker-ssh" in present:
             broker_expression = [
                 {"match": {"op": "==", "left": {"meta": {"key": "skuid"}},
                            "right": self.broker_uid}},
                 {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}},
                            "right": 22}}, {"drop": None}]
-            broker = rules[1]
+            broker = present["deadbolt:emergency-broker-ssh"]
             if (self.broker_uid is None or broker.get("family") != "inet"
                     or broker.get("table") != self.table or broker.get("chain") != self.chain
                     or broker.get("comment") != "deadbolt:emergency-broker-ssh"
                     or broker.get("expr") != broker_expression):
                 raise ActionError("emergency broker rule was changed externally")
-            return "complete"
-        return "legacy" if self.broker_uid is not None else "complete"
+        if "deadbolt:emergency-proxy" in present:
+            proxy = present["deadbolt:emergency-proxy"]
+            proxy_expression = [
+                {"match": {"op": "==", "left": {"meta": {"key": "skuid"}},
+                           "right": self.proxy_uid}}, {"drop": None}]
+            if (self.proxy_uid is None or proxy.get("family") != "inet"
+                    or proxy.get("table") != self.table or proxy.get("chain") != self.chain
+                    or proxy.get("expr") != proxy_expression):
+                raise ActionError("emergency SSH proxy block was changed externally")
+        if set(present) - {"deadbolt:emergency-broker-ssh", "deadbolt:emergency-proxy"}:
+            raise ActionError("emergency nftables rule was changed externally")
+        complete = ((self.broker_uid is None or "deadbolt:emergency-broker-ssh" in present)
+                    and (self.proxy_uid is None or "deadbolt:emergency-proxy" in present))
+        return "complete" if complete else "legacy"
 
     def enabled(self) -> bool:
         return self._block_state() == "complete"
@@ -509,9 +535,17 @@ class EmergencyAction:
                       "{ type filter hook output priority -150; policy accept; }\n"
                       f"add rule inet {self.table} {self.chain} meta skuid {self.hermes_uid} "
                       f'drop comment "{self.comment}"\n')
-        if self.broker_uid is not None:
+        present = set()
+        if state == "legacy":
+            present = {rule.get("comment") for key, rule in
+                       self._objects(self._call(["/usr/sbin/nft", "-j", "list", "table", "inet", self.table]))
+                       if key == "rule"}
+        if self.broker_uid is not None and "deadbolt:emergency-broker-ssh" not in present:
             script += (f"add rule inet {self.table} {self.chain} meta skuid {self.broker_uid} "
                        'tcp dport 22 drop comment "deadbolt:emergency-broker-ssh"\n')
+        if self.proxy_uid is not None and "deadbolt:emergency-proxy" not in present:
+            script += (f"add rule inet {self.table} {self.chain} meta skuid {self.proxy_uid} "
+                       'drop comment "deadbolt:emergency-proxy"\n')
         self._call(["/usr/sbin/nft", "-f", "-"], script)
         if not self.enabled():
             raise ActionError("emergency block could not be verified")

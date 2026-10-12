@@ -1,0 +1,10 @@
+[Unit]
+Description=End expired recorded SSH proxy grants independently of Hermes
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/deadbolt/venv/bin/deadbolt-ssh-proxy-expire
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/deadbolt/ssh-proxy

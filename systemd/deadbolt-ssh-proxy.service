@@ -1,0 +1,29 @@
+[Unit]
+Description=Deadbolt loopback recorded SSH-MITM proxy
+Requires=deadbolt-executor.service deadbolt-ssh-exporter.service
+After=deadbolt-executor.service deadbolt-ssh-exporter.service
+ConditionPathExists=/run/deadbolt/ssh-proxy/lease.json
+
+[Service]
+Type=simple
+User=deadbolt-ssh-proxy
+Group=deadbolt-ssh-proxy
+StateDirectory=deadbolt-ssh-proxy
+StateDirectoryMode=0700
+ExecStart=/opt/deadbolt/venv/bin/deadbolt-ssh-proxy
+Restart=no
+TimeoutStopSec=5s
+KillMode=control-group
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/run/deadbolt/ssh-proxy /etc/deadbolt-ssh-proxy
+ReadWritePaths=/var/lib/deadbolt-ssh-proxy/ssh-spool
+UMask=0077
+MemoryMax=512M

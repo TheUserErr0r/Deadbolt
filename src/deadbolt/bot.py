@@ -15,6 +15,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from deadbolt.access import command_argv, destination, purpose
+from deadbolt.outbound import literal_ip, exact_port
 
 from deadbolt.protocol import (EMERGENCY_RESPONSE_TIMEOUT_SECONDS, SSH_RESPONSE_TIMEOUT_SECONDS, MAX_MESSAGE_BYTES,
                                ProtocolError, peer_uid, read_message, require_fields, rpc,
@@ -88,6 +89,12 @@ class Relay:
             raise ProtocolError("unauthorized Unix peer")
         if self.emergency_stops_in_progress:
             raise ProtocolError("emergency stop in progress")
+        if message.get("op") == "outbound_status":
+            require_fields(message, {"op", "request_id"})
+            if not isinstance(message["request_id"], str):
+                raise ProtocolError("invalid outbound request ID")
+            return await self.root({"op": "outbound_status", "request_id": message["request_id"],
+                                    "requested_by_uid": uid})
         if message.get("op") == "ssh_execute":
             require_fields(message, {"op", "request_id", "destination", "argv"})
             if not isinstance(message["request_id"], str):
@@ -99,6 +106,27 @@ class Relay:
                                     "requested_by_uid": uid}, ssh_response=True)
         if message.get("op") != "submit":
             raise ProtocolError("Hermes may only submit requests")
+        if message.get("action") == "outbound_access":
+            kind = message.get("kind")
+            required = {"op", "action", "kind", "destination", "port", "purpose", "ttl_seconds"}
+            require_fields(message, required, {"transport"} if kind == "raw" else frozenset())
+            if kind not in ("ssh", "raw"):
+                raise ProtocolError("outbound kind must explicitly be ssh or raw")
+            literal_ip(message["destination"])
+            exact_port(message["port"])
+            purpose(message["purpose"])
+            if type(message["ttl_seconds"]) is not int or message["ttl_seconds"] < 1:
+                raise ProtocolError("invalid outbound TTL")
+            if kind == "raw" and message.get("transport") not in ("tcp", "udp"):
+                raise ProtocolError("raw access requires explicit TCP or UDP")
+            payload = {"op": "create", "action": "outbound_access", "profile": kind,
+                       "kind": kind, "destination": message["destination"],
+                       "port": message["port"], "purpose": message["purpose"],
+                       "reason": message["purpose"], "ttl_seconds": message["ttl_seconds"],
+                       "requested_by_uid": uid}
+            if kind == "raw":
+                payload["transport"] = message["transport"]
+            return await self.root(payload)
         if message.get("action") == "access_grant":
             require_fields(message, {"op", "action", "profile", "destination", "purpose",
                                      "ttl_seconds", "command"})
@@ -188,6 +216,12 @@ class Relay:
                                  "user_id": user_id, "guild_id": guild_id,
                                  "channel_id": channel_id}))["request"]
 
+    async def revoke_outbound(self, request_id: str, interaction_id: str, user_id: str,
+                              guild_id: str, channel_id: str) -> dict[str, Any]:
+        return (await self.root({"op": "outbound_revoke", "request_id": request_id,
+                                 "interaction_id": interaction_id, "user_id": user_id,
+                                 "guild_id": guild_id, "channel_id": channel_id}))["request"]
+
     async def emergency_operator(self, operation: str, interaction_id: str, user_id: str,
                                  guild_id: str, channel_id: str) -> dict[str, Any]:
         if operation not in ("emergency_status", "emergency_stop", "emergency_recover_create"):
@@ -205,20 +239,24 @@ class Relay:
         return response["request"] if operation == "emergency_recover_create" else response["emergency"]
 
     async def decide(self, row: dict[str, Any], decision: str, interaction_id: str,
-                     user_id: str, guild_id: str, channel_id: str) -> dict[str, Any]:
-        return (await self.root({"op": "decide", "request_id": row["id"], "decision": decision,
+                     user_id: str, guild_id: str, channel_id: str,
+                     raw_ssh_confirmed: bool = False) -> dict[str, Any]:
+        payload = {"op": "decide", "request_id": row["id"], "decision": decision,
                                  "nonce": row["nonce"], "canonical_hash": row["canonical_hash"],
                                  "user_id": user_id, "guild_id": guild_id, "channel_id": channel_id,
                                  "message_id": row["posted_message_id"],
-                                 "interaction_id": interaction_id},
+                                 "interaction_id": interaction_id}
+        if raw_ssh_confirmed:
+            payload["raw_ssh_confirmed"] = True
+        return (await self.root(payload,
                                  emergency_response=(decision == "approve" and
                                                      row.get("action") == "emergency_recover"),
                                  ssh_response=(decision == "approve" and
-                                               row.get("action") == "access_grant")))["request"]
+                                               row.get("action") in ("access_grant", "outbound_access"))))["request"]
 
     async def decide_posted(self, card: dict[str, Any], decision: str, message_id: str,
                             interaction_id: str, user_id: str, guild_id: str,
-                            channel_id: str) -> dict[str, Any]:
+                            channel_id: str, raw_ssh_confirmed: bool = False) -> dict[str, Any]:
         # A view is created before Discord assigns the message ID. Fetch the
         # posted record at click time so its decision uses the actual ID.
         rows = await self.list_all("posted")
@@ -227,7 +265,8 @@ class Relay:
                 or current["nonce"] != card["nonce"]
                 or current["canonical_hash"] != card["canonical_hash"]):
             raise ProtocolError("approval card no longer matches posted request")
-        return await self.decide(current, decision, interaction_id, user_id, guild_id, channel_id)
+        return await self.decide(current, decision, interaction_id, user_id, guild_id,
+                                 channel_id, raw_ssh_confirmed)
 
     async def serve_ingress(self) -> asyncio.AbstractServer:
         if os.geteuid() == 0 or pwd.getpwuid(os.geteuid()).pw_name != "deadbolt":
@@ -275,16 +314,17 @@ async def poll_pending(relay: Relay, post: Callable[[dict[str, Any]], Awaitable[
 
 async def handle_approval_button(relay: Relay, card_row: dict[str, Any], interaction: Any,
                                  decision: str, allowed: Callable[[Any], bool],
-                                 render_card: Callable[[dict[str, Any]], Any]) -> None:
+                                 render_card: Callable[[dict[str, Any]], Any],
+                                 raw_ssh_confirmed: bool = False) -> None:
     """Handle a Discord button using the posted record, without needing a live Gateway in tests."""
     if not allowed(interaction) or not interaction.message:
         await interaction.response.send_message("Not authorized for this approval.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        updated = await relay.decide_posted(
-            card_row, decision, str(interaction.message.id), str(interaction.id),
-            str(interaction.user.id), str(interaction.guild_id), str(interaction.channel_id))
+        args = (card_row, decision, str(interaction.message.id), str(interaction.id),
+                str(interaction.user.id), str(interaction.guild_id), str(interaction.channel_id))
+        updated = await relay.decide_posted(*args, True) if raw_ssh_confirmed else await relay.decide_posted(*args)
     except Exception as exc:
         await interaction.followup.send(f"Decision rejected: {exc}", ephemeral=True)
         return
@@ -338,12 +378,14 @@ async def run_discord(config: BotConfig) -> None:
     def view_for(row: dict[str, Any]) -> discord.ui.View:
         view = discord.ui.View(timeout=None)
         for decision in ("approve", "deny"):
-            button = discord.ui.Button(label=decision.capitalize(),
+            raw_ssh = decision == "approve" and row.get("raw_ssh_bypass") is True
+            button = discord.ui.Button(label="Approve uninspected SSH" if raw_ssh else decision.capitalize(),
                 style=discord.ButtonStyle.success if decision == "approve" else discord.ButtonStyle.danger,
                 custom_id=f"deadbolt:{decision}:{row['id']}:{row['nonce']}")
 
-            async def callback(interaction: discord.Interaction, choice: str = decision) -> None:
-                await handle_approval_button(relay, row, interaction, choice, allowed, card)
+            async def callback(interaction: discord.Interaction, choice: str = decision,
+                               confirmed: bool = raw_ssh) -> None:
+                await handle_approval_button(relay, row, interaction, choice, allowed, card, confirmed)
 
             button.callback = callback
             view.add_item(button)
@@ -376,6 +418,20 @@ async def run_discord(config: BotConfig) -> None:
                                             ephemeral=True)
         except Exception as exc:
             await interaction.followup.send(f"Access revoke failed: {exc}", ephemeral=True)
+
+    @group.command(name="outbound_revoke", description="End an approved raw or recorded SSH grant")
+    async def outbound_revoke_cmd(interaction: discord.Interaction, request_id: str) -> None:
+        if not allowed(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            row = await relay.revoke_outbound(request_id, str(interaction.id),
+                str(interaction.user.id), str(interaction.guild_id), str(interaction.channel_id))
+            await interaction.followup.send(f"Outbound request {row['id']}: {row['status']}",
+                                            ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"Outbound revoke failed: {exc}", ephemeral=True)
 
     @group.command(name="deny", description="Deny a pending Deadbolt request")
     async def deny_cmd(interaction: discord.Interaction, request_id: str) -> None:

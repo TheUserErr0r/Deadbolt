@@ -1,0 +1,22 @@
+[Unit]
+Description=Deliver restricted SSH transcripts to Argus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/deadbolt/ssh-exporter.env
+ExecStart=/opt/deadbolt/venv/bin/deadbolt-transcript-exporter --spool /var/lib/deadbolt-ssh-proxy/ssh-spool --host ${DEADBOLT_ARGUS_HOST} --port ${DEADBOLT_ARGUS_PORT} --ca /etc/deadbolt/ssh-export/argus-ca.pem --cert /etc/deadbolt/ssh-export/hermes-client.pem --key /etc/deadbolt/ssh-export/hermes-client.key
+Restart=on-failure
+RestartSec=5s
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/deadbolt-ssh-proxy/ssh-spool
+ReadOnlyPaths=/etc/deadbolt/ssh-export
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
