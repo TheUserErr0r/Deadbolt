@@ -8,7 +8,7 @@ from deadbolt.actions import EmergencyAction
 
 
 def main() -> None:
-    action = EmergencyAction(12345, broker_uid=12346)
+    action = EmergencyAction(12345, broker_uid=12346, proxy_uid=12347)
     assert not action.enabled()
     try:
         legacy = EmergencyAction(12345)
@@ -22,6 +22,7 @@ def main() -> None:
                                 capture_output=True, timeout=10).stdout
         assert "meta skuid 12345 drop" in listed
         assert "meta skuid 12346 tcp dport 22 drop" in listed
+        assert "meta skuid 12347 drop" in listed
     finally:
         subprocess.run(["/usr/sbin/nft", "delete", "table", "inet", "deadbolt_killswitch"],
                        check=False, capture_output=True, timeout=10)

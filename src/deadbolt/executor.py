@@ -22,6 +22,9 @@ from typing import Any, Callable
 from deadbolt.actions import ActionError, CaptureAction, CaptureError, EmergencyAction, ExclusionsAction, UfwAction
 from deadbolt.access import AccessError, canonical_access, command_argv, describe_access, destination
 from deadbolt.broker_firewall import BrokerFirewall, BrokerFirewallError
+from deadbolt.outbound import OutboundError, canonical_outbound, describe_outbound
+from deadbolt.outbound_firewall import ExactEgress, OutboundFirewallError
+from deadbolt.proxy_manager import ProxyManager, ProxyError
 from deadbolt.config import ConfigurationError, ExecutorConfig, Policy, describe_action, normalize_workload_units, resolve_action
 from deadbolt.protocol import MAX_MESSAGE_BYTES, ProtocolError, peer_uid, read_message, require_fields, write_message
 from deadbolt.store import StateError, Store, canonical_json
@@ -58,7 +61,9 @@ class Executor:
                  exclusions_action: ExclusionsAction | None = None,
                  emergency_action: EmergencyAction | None = None,
                  access_action: BrokerFirewall | None = None,
-                 ssh_executor: SystemdSSHExecutor | None = None):
+                 ssh_executor: SystemdSSHExecutor | None = None,
+                 outbound_firewall: ExactEgress | None = None,
+                 proxy_manager: ProxyManager | None = None):
         self.config = config
         self.policy = policy
         self.policy_loader = policy_loader or (lambda: Policy.load(config.profiles_path))
@@ -72,6 +77,17 @@ class Executor:
             broker_uid = None
         self.access_action = access_action or (BrokerFirewall(broker_uid) if broker_uid and policy.access_profiles else None)
         self.ssh_executor = ssh_executor or SystemdSSHExecutor()
+        proxy_uid = None
+        if policy.outbound_access.enabled or store.active_outbound_rows():
+            try:
+                proxy_uid = pwd.getpwnam("deadbolt-ssh-proxy").pw_uid
+            except KeyError as exc:
+                if outbound_firewall is None:
+                    raise ConfigurationError("deadbolt-ssh-proxy account is required") from exc
+        self.outbound_firewall = outbound_firewall or (
+            ExactEgress(pwd.getpwnam(config.hermes_user).pw_uid, proxy_uid)
+            if proxy_uid is not None else None)
+        self.proxy_manager = proxy_manager or ProxyManager()
         self.capture_action = capture_action or CaptureAction()
         self.exclusions_action = exclusions_action or ExclusionsAction()
         self.clock = clock
@@ -82,7 +98,7 @@ class Executor:
         self.bot_gid = bot_account.pw_gid
         self.hermes_uid = pwd.getpwnam(config.hermes_user).pw_uid
         self.emergency_action = emergency_action or EmergencyAction(self.hermes_uid,
-            broker_uid=broker_uid)
+            broker_uid=broker_uid, proxy_uid=proxy_uid)
         self.host_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deadbolt-host")
         self.emergency_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deadbolt-emergency")
 
@@ -123,6 +139,11 @@ class Executor:
                 raise StateError("restricted SSH audit sink is not configured")
             current = canonical_access(profile, original["destination"], original["purpose"],
                                        original["ttl_seconds"], original["initial_command"])
+        elif original["action"] == "outbound_access":
+            current = canonical_outbound(policy.outbound_access, kind=original["kind"],
+                destination=original["destination"], port=original["port"],
+                ttl_seconds=original["ttl_seconds"], purpose=original["purpose"],
+                transport=original["transport"] if original["kind"] == "raw" else None)
         elif exclusions:
             self.exclusions_action.validate(original)
             if (original["hostname"] not in policy.body_exclusion_allowed_hosts
@@ -137,7 +158,7 @@ class Executor:
         if (canonical_json(current) != row["canonical_json"] or
                 hashlib.sha256(row["canonical_json"].encode()).hexdigest() != row["canonical_hash"]):
             raise StateError("stored action no longer matches root policy")
-        if original["action"] not in ("emergency_recover", "access_grant"):
+        if original["action"] not in ("emergency_recover", "access_grant", "outbound_access"):
             (self.capture_action if capture else self.exclusions_action if exclusions else
              self.action).validate(current)
         return current
@@ -193,13 +214,22 @@ class Executor:
         try:
             # Block both UIDs before touching a broker unit or a slow proxy.
             await self._emergency_call(self.emergency_action.install_block)
+            failures: list[str] = []
+            for outbound in self.store.active_outbound_rows():
+                try:
+                    outbound = self.store.begin_outbound_revoke(outbound["id"], self.clock(),
+                                                               message["user_id"])
+                    await self._revoke_outbound(outbound, emergency=True)
+                    self.store.mark_outbound_revoked(outbound["id"], self.clock(),
+                        message["user_id"], "emergency_stop; request a new grant")
+                except Exception:
+                    failures.append("outbound grant revocation failed")
             if first_stop:
                 previous = await self._emergency_call(self.emergency_action.active_units, units)
                 state = self.store.emergency_transition(("stopping",), "stopping",
                     "emergency_stop_units_recorded", self.clock(),
                     operator_id=message["user_id"], interaction_id=message["interaction_id"],
                     previously_active=previous)
-            failures: list[str] = []
             for execution in self.store.interrupted_access_executions():
                 partial = None
                 try:
@@ -253,7 +283,8 @@ class Executor:
         now = self.clock()
         if op == "create":
             require_fields(message, {"op", "action", "profile", "reason", "requested_by_uid"},
-                           {"ttl_seconds", "hours", "destination", "purpose", "command"})
+                           {"ttl_seconds", "hours", "destination", "purpose", "command",
+                            "kind", "port", "transport"})
             if type(message["requested_by_uid"]) is not int or message["requested_by_uid"] != self.hermes_uid:
                 raise ProtocolError("invalid claimed request origin")
             if not all(isinstance(message[key], str) for key in ("action", "profile", "reason")):
@@ -273,8 +304,23 @@ class Executor:
                 canonical = canonical_access(profile, message["destination"], message["purpose"],
                                              message["ttl_seconds"], message.get("command"))
                 description = describe_access(canonical)
+            elif message["action"] == "outbound_access":
+                required = {"op", "action", "profile", "reason", "requested_by_uid",
+                            "kind", "destination", "port", "purpose", "ttl_seconds"}
+                require_fields(message, required,
+                    {"transport"} if message.get("kind") == "raw" else frozenset())
+                if (message["reason"] != message["purpose"]
+                        or message["profile"] != message["kind"]):
+                    raise ProtocolError("outbound request fields disagree")
+                if self.outbound_firewall is None:
+                    raise OutboundError("outbound firewall is not configured")
+                canonical = canonical_outbound(self.policy_loader().outbound_access,
+                    kind=message["kind"], destination=message["destination"],
+                    port=message["port"], ttl_seconds=message["ttl_seconds"],
+                    purpose=message["purpose"], transport=message.get("transport"))
+                description = describe_outbound(canonical)
             else:
-                if set(message) & {"destination", "purpose", "command"}:
+                if set(message) & {"destination", "purpose", "command", "kind", "port", "transport"}:
                     raise ProtocolError("unexpected access fields")
                 canonical = resolve_action(message["action"], message["profile"], message["reason"],
                                            message.get("ttl_seconds"), self.policy_loader(), self.config,
@@ -343,6 +389,29 @@ class Executor:
         if op == "status":
             require_fields(message, {"op", "request_id"})
             row = self.store.get(message["request_id"])
+            return {"ok": True, "request": self.store.public(row)}
+        if op == "outbound_status":
+            require_fields(message, {"op", "request_id", "requested_by_uid"})
+            if message["requested_by_uid"] != self.hermes_uid:
+                raise ProtocolError("invalid claimed request origin")
+            row = self.store.get(message["request_id"])
+            if row["action"] != "outbound_access" or row["requested_by_uid"] != self.hermes_uid:
+                raise StateError("request is not a Hermes outbound grant")
+            result = self.store.public(row)
+            if row["status"] in ("revoked", "rolled_back", "failed"):
+                result["guidance"] = "Access ended; request a new Zeus approval."
+            return {"ok": True, "request": result}
+        if op == "outbound_revoke":
+            require_fields(message, {"op", "request_id", "user_id", "guild_id", "channel_id", "interaction_id"})
+            self._operator(message)
+            row = self.store.get(message["request_id"])
+            if row["action"] != "outbound_access":
+                raise StateError("request is not an outbound grant")
+            if row["status"] in ("revoked", "rolled_back"):
+                return {"ok": True, "request": self.store.public(row)}
+            row = self.store.begin_outbound_revoke(row["id"], now, message["user_id"])
+            await self._revoke_outbound(row)
+            row = self.store.mark_outbound_revoked(row["id"], self.clock(), message["user_id"])
             return {"ok": True, "request": self.store.public(row)}
         if op == "access_revoke":
             require_fields(message, {"op", "request_id", "user_id", "guild_id", "channel_id", "interaction_id"})
@@ -474,14 +543,24 @@ class Executor:
         if op == "decide":
             required = {"op", "request_id", "decision", "nonce", "canonical_hash", "user_id",
                         "guild_id", "channel_id", "message_id", "interaction_id"}
-            require_fields(message, required)
+            require_fields(message, required, {"raw_ssh_confirmed"})
             if any(not isinstance(message[key], str) for key in required - {"op"}):
                 raise ProtocolError("invalid decision fields")
             row = self.store.get(message["request_id"])
+            pending_canonical = json.loads(row["canonical_json"])
+            raw_ssh = (row["action"] == "outbound_access"
+                       and pending_canonical["kind"] == "raw"
+                       and pending_canonical["transport"] == "tcp"
+                       and pending_canonical["port"] == 22)
+            if (message["decision"] == "approve" and raw_ssh
+                    and message.get("raw_ssh_confirmed") is not True):
+                raise ProtocolError("raw TCP/22 requires explicit uninspected SSH confirmation")
+            if "raw_ssh_confirmed" in message and type(message["raw_ssh_confirmed"]) is not bool:
+                raise ProtocolError("invalid raw SSH confirmation")
             try:
                 self._revalidate(row)
-            except (AccessError, StateError, ActionError, ConfigurationError) as exc:
-                if row["action"] == "access_grant" and row["status"] in ("pending", "posted"):
+            except (AccessError, OutboundError, StateError, ActionError, ConfigurationError) as exc:
+                if row["action"] in ("access_grant", "outbound_access") and row["status"] in ("pending", "posted"):
                     self.store.invalidate_pending(row["id"], now, str(exc))
                 raise
             row = self.store.decide(message["request_id"], message["decision"], message["nonce"],
@@ -524,9 +603,76 @@ class Executor:
         if not message["interaction_id"].isdecimal():
             raise ProtocolError("invalid interaction ID")
 
+    async def _revoke_outbound(self, row: Any, *, emergency: bool = False) -> None:
+        if self.outbound_firewall is None:
+            raise OutboundFirewallError("outbound firewall is not configured")
+        intent = json.loads(row["rollback_json"])
+        call = self._emergency_call if emergency else self._host_call
+        failures: list[str] = []
+        try:
+            await call(self.outbound_firewall.revoke, intent["kind"], intent["ip"],
+                       intent["port"], intent["transport"], row["id"], intent["expiry"])
+        except Exception:
+            failures.append("exact outbound firewall revocation failed")
+        if intent["kind"] == "ssh":
+            try:
+                await call(self.proxy_manager.revoke, row["id"])
+            except Exception:
+                failures.append("SSH proxy session termination failed")
+        if failures:
+            self.store.rollback_error(row["id"], "; ".join(failures), self.clock())
+            raise OutboundFirewallError("; ".join(failures))
+
     async def _execute(self, row: Any) -> Any:
         request_id = row["id"]
         now = self.clock()
+        if row["action"] == "outbound_access":
+            try:
+                if self.store.emergency_state()["state"] != "inactive":
+                    raise StateError("emergency stop blocks outbound grants")
+                canonical = self._revalidate(row)
+                policy = self.policy_loader().outbound_access
+                if canonical["kind"] == "ssh" and any(
+                    json.loads(item["canonical_json"])["kind"] == "ssh"
+                    for item in self.store.active_outbound_rows()):
+                    raise StateError("another recorded SSH grant is active")
+                if self.outbound_firewall is None:
+                    raise OutboundFirewallError("outbound firewall is not configured")
+                expiry = int(self.clock() + canonical["ttl_seconds"])
+                intent = {"kind": canonical["kind"], "ip": canonical["destination"],
+                          "port": canonical["port"], "transport": canonical["transport"],
+                          "uid": (self.outbound_firewall.proxy_uid if canonical["kind"] == "ssh"
+                                  else self.hermes_uid),
+                          "chain": self.outbound_firewall._chain(canonical["kind"],
+                              canonical["port"], canonical["transport"]),
+                          "tag": self.outbound_firewall._validated(canonical["destination"],
+                              canonical["port"], canonical["transport"], request_id, expiry),
+                          "expiry": expiry}
+                if canonical["kind"] == "ssh":
+                    intent["proxy_port"] = policy.proxy_port
+                self.store.mark_executing(request_id, intent, self.clock())
+                await self._host_call(self.outbound_firewall.ensure_grant,
+                    canonical["kind"], canonical["destination"], canonical["port"],
+                    canonical["transport"], request_id, expiry, self.clock())
+                if canonical["kind"] == "ssh":
+                    await self._host_call(self.proxy_manager.activate, policy, canonical,
+                                          request_id, expiry)
+                    await self._host_call(self.proxy_manager.assert_active, request_id, expiry)
+                await self._host_call(self.outbound_firewall.assert_grant,
+                    canonical["kind"], canonical["destination"], canonical["port"],
+                    canonical["transport"], request_id, expiry)
+                if self.store.emergency_state()["state"] != "inactive" or self.clock() >= expiry:
+                    raise StateError("outbound grant interrupted before activation")
+                return self.store.mark_active(request_id, self.clock(), active_until=expiry)
+            except Exception as exc:
+                if self.store.get(request_id)["status"] == "executing":
+                    try:
+                        await self._revoke_outbound(self.store.get(request_id))
+                    except Exception:
+                        return self.store.get(request_id)
+                failure = (str(exc) if isinstance(exc, (StateError, OutboundError,
+                           OutboundFirewallError, ProxyError)) else "internal outbound access error")
+                return self.store.mark_failed(request_id, failure, self.clock())
         if row["action"] == "access_grant":
             try:
                 if self.store.emergency_state()["state"] != "inactive":
@@ -669,6 +815,38 @@ class Executor:
         async with self.lock:
             now = self.clock()
             self.store.expire_pending(now)
+            if self.outbound_firewall is not None:
+                await self._host_call(self.outbound_firewall.ensure_guard)
+                for outbound in self.store.active_outbound_rows():
+                    intent = json.loads(outbound["rollback_json"])
+                    expired = outbound["active_until"] is not None and outbound["active_until"] <= now
+                    interrupted = self.store.emergency_state()["state"] != "inactive"
+                    try:
+                        self._revalidate(outbound)
+                    except (OutboundError, StateError, ConfigurationError):
+                        interrupted = True
+                    if outbound["status"] == "revoking" or expired or interrupted:
+                        if outbound["status"] == "active":
+                            outbound = self.store.begin_outbound_revoke(outbound["id"], now,
+                                                                        "reconciliation")
+                        await self._revoke_outbound(outbound)
+                        self.store.mark_outbound_revoked(outbound["id"], self.clock(),
+                            "reconciliation", "expired or interrupted; request a new grant")
+                        continue
+                    if intent["kind"] == "ssh":
+                        try:
+                            await self._host_call(self.proxy_manager.assert_active,
+                                outbound["id"], intent["expiry"])
+                        except ProxyError:
+                            outbound = self.store.begin_outbound_revoke(outbound["id"], now,
+                                                                        "reconciliation")
+                            await self._revoke_outbound(outbound)
+                            self.store.mark_outbound_revoked(outbound["id"], self.clock(),
+                                "reconciliation", "proxy unavailable; request a new grant")
+                            continue
+                    await self._host_call(self.outbound_firewall.ensure_grant,
+                        intent["kind"], intent["ip"], intent["port"], intent["transport"],
+                        outbound["id"], intent["expiry"], now)
             if self.access_action is not None:
                 await self._host_call(self.access_action.ensure_guard)
                 for execution in self.store.interrupted_access_executions():
@@ -770,6 +948,8 @@ class Executor:
                         assert self.access_action is not None
                         await self._host_call(self.access_action.revoke,
                             rollback["pinned_ip"], row["id"], rollback["expiry"])
+                    elif row["action"] == "outbound_access":
+                        await self._revoke_outbound(row)
                     else:
                         self.action.rollback(canonical, rollback)
                 except Exception as exc:
@@ -793,7 +973,7 @@ class Executor:
             message = await read_message(reader)
             response = await self.dispatch(message, self.bot_uid)
         except (ProtocolError, StateError, ConfigurationError, ActionError, AccessError,
-                BrokerFirewallError, ValueError) as exc:
+                BrokerFirewallError, OutboundError, OutboundFirewallError, ProxyError, ValueError) as exc:
             response = {"ok": False, "error": str(exc)}
         except Exception:
             LOG.exception("unexpected executor error")

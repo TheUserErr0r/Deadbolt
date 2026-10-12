@@ -1,0 +1,11 @@
+[Unit]
+Description=Check recorded SSH proxy expiry every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+Unit=deadbolt-ssh-proxy-expiry.service
+
+[Install]
+WantedBy=timers.target

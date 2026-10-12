@@ -222,12 +222,21 @@ class UfwTests(unittest.TestCase):
         inbound = {**self.request, "direction": "in", "source": "192.0.2.1/32",
                    "destination": "any", "port": "443"}
         self.assertEqual(self.action._rule(inbound),
-                         ["allow", "from", "192.0.2.1/32", "to", "any", "port", "443", "proto", "tcp"])
+                         ["allow", "from", "192.0.2.1", "to", "any", "port", "443", "proto", "tcp"])
         interface = {**self.request, "interface": "eth0", "protocol": "udp",
                      "destination": "2001:db8::/64", "port": "8000:8002"}
         self.assertEqual(self.action._rule(interface),
                          ["allow", "out", "on", "eth0", "to", "2001:db8::/64",
                           "port", "8000:8002", "proto", "udp"])
+
+    def test_singleton_cidr_matches_ufw_display_and_rolls_back(self) -> None:
+        request = {**self.request, "destination": "192.0.2.5/32"}
+        self.assertEqual(self.action._rule(request),
+                         ["allow", "out", "to", "192.0.2.5", "port", "22", "proto", "tcp"])
+        intent = self.action.prepare(request, "00000000-0000-4000-8000-000000000001")
+        self.action.apply(request, intent)
+        self.action.rollback(request, intent)
+        self.assertFalse(self.fake.rules)
 
     def test_existing_rule_is_untouched(self) -> None:
         rule = self.action._rule(self.request)

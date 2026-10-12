@@ -1,0 +1,22 @@
+[Unit]
+Description=Argus restricted Deadbolt SSH transcript receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/deadbolt-transcripts/receiver.env
+ExecStart=/opt/deadbolt/venv/bin/deadbolt-transcript-receiver --cert /etc/deadbolt-transcripts/server.pem --key /etc/deadbolt-transcripts/server.key --client-ca /etc/deadbolt-transcripts/hermes-ca.pem --listen 0.0.0.0 --port 8443 --loki-url ${DEADBOLT_RESTRICTED_LOKI_URL} --loki-tenant ${DEADBOLT_RESTRICTED_LOKI_TENANT}
+Restart=on-failure
+RestartSec=5s
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=yes
+ReadWritePaths=/srv/argus/deadbolt/ssh-transcripts
+ReadOnlyPaths=/etc/deadbolt-transcripts
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

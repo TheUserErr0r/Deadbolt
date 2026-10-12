@@ -9,6 +9,7 @@ User=root
 Group=root
 ExecStartPre=/opt/deadbolt/venv/bin/deadbolt-emergency-restore --config /etc/deadbolt/executor.toml
 ExecStartPre=/opt/deadbolt/venv/bin/deadbolt-ssh-guard --config /etc/deadbolt/executor.toml
+ExecStartPre=/opt/deadbolt/venv/bin/deadbolt-outbound-guard --config /etc/deadbolt/executor.toml
 ExecStart=/opt/deadbolt/venv/bin/deadbolt-executor --config /etc/deadbolt/executor.toml
 Restart=on-failure
 RestartSec=3s

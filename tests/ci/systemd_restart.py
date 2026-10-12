@@ -70,7 +70,7 @@ def assert_runtime() -> int:
 
 def main() -> None:
     assert os.geteuid() == 0
-    for user in ("deadbolt", "hermes"):
+    for user in ("deadbolt", "hermes", "deadbolt-ssh-proxy"):
         run("useradd", "--system", "--user-group", "--no-create-home",
             "--shell", "/usr/sbin/nologin", user)
     config_dir = Path("/etc/deadbolt")

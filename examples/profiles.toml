@@ -7,6 +7,26 @@
 # session but are checked and audited separately.
 [access_profiles]
 
+# Disabled until the dedicated proxy user, pinned keys, exact firewall guard,
+# restricted spool/exporter, and Argus receiver are installed and verified.
+# This policy is root-owned; Hermes supplies only kind, literal IP, port,
+# purpose, and requested duration. The hard maximum may be at most 24 hours.
+# [outbound_access]
+# enabled = true
+# max_ttl_seconds = 86400
+# allowed_cidrs = ["192.168.1.0/24"]
+# allow_public = false
+# proxy_port = 10022
+# proxy_host_key = "/etc/deadbolt-ssh-proxy/host_ed25519"
+# hermes_client_key = "/etc/deadbolt-ssh-proxy/hermes.pub"
+# spool_dir = "/var/lib/deadbolt-ssh-proxy/ssh-spool"
+# [[outbound_access.ssh_targets]]
+# ip = "192.168.1.205"
+# port = 22
+# user = "reptor"
+# key = "/etc/deadbolt-ssh-proxy/keys/sysreptor"
+# host_fingerprint = "SHA256:REPLACE_WITH_VERIFIED_TARGET_FINGERPRINT"
+
 # [access_profiles.ssh-session]
 # direction = "out"
 # protocol = "tcp"

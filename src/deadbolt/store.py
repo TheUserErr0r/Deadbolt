@@ -214,7 +214,7 @@ class Store:
             self._event(request_id, "request_created", now, action=canonical["action"],
                         profile=canonical["profile"], ttl_seconds=canonical["ttl_seconds"],
                         requested_by_uid=requested_by_uid, requested_by_discord_id=requested_by_discord_id,
-                        destination=canonical.get("destination") if canonical["action"] == "access_grant" else None,
+                        destination=canonical.get("destination"),
                         pinned_ips=canonical.get("pinned_ips"), ports=canonical.get("ports"),
                         protocol=canonical.get("protocol"), purpose=canonical.get("purpose"),
                         first_command=(command_summary(canonical["initial_command"])
@@ -282,7 +282,7 @@ class Store:
             self._event(request_id, "approval_granted" if decision == "approve" else "approval_denied", now,
                         action=row["action"], profile=row["profile"],
                         approved_by_discord_id=user_id, canonical_hash=canonical_hash,
-                        destination=canonical.get("destination") if row["action"] == "access_grant" else None,
+                        destination=canonical.get("destination"),
                         pinned_ips=canonical.get("pinned_ips"), purpose=canonical.get("purpose"),
                         first_command=(command_summary(canonical["initial_command"])
                             if canonical.get("audit_output") == "full" else canonical.get("initial_command")),
@@ -317,6 +317,13 @@ class Store:
                 fields.update(destination=canonical["destination"], pinned_ips=canonical["pinned_ips"],
                               ports=canonical["ports"], protocol=canonical["protocol"],
                               purpose=canonical["purpose"], rule_identity=json.loads(row["rollback_json"]))
+            elif row["action"] == "outbound_access":
+                canonical = json.loads(row["canonical_json"])
+                intent = json.loads(row["rollback_json"])
+                fields.update(destination=canonical["destination"], port=canonical["port"],
+                              protocol=canonical["transport"], purpose=canonical["purpose"],
+                              kind=canonical["kind"], uid=intent["uid"],
+                              rule_identity=intent["tag"])
             if helper_outcome is not None:
                 fields["helper_outcome"] = helper_outcome
             self._event(request_id, "grant_active", now, **fields)
@@ -352,13 +359,15 @@ class Store:
             self._event(request_id, "execution_failed", now, **fields)
         return self.get(request_id)
 
-    def mark_rolled_back(self, request_id: str, now: float) -> sqlite3.Row:
+    def mark_rolled_back(self, request_id: str, now: float,
+                         reason: str | None = None) -> sqlite3.Row:
         with self.db:
             row = self.get(request_id)
             if row["status"] != "active":
                 raise StateError("request is not active")
-            self.db.execute("UPDATE requests SET status='rolled_back' WHERE id=?", (request_id,))
-            self._event(request_id, "grant_rolled_back", now)
+            self.db.execute("UPDATE requests SET status='rolled_back',last_error=? WHERE id=?",
+                            (reason, request_id))
+            self._event(request_id, "grant_rolled_back", now, reason=reason)
         return self.get(request_id)
 
     def begin_access_revoke(self, request_id: str, now: float, operator_id: str) -> sqlite3.Row:
@@ -374,6 +383,33 @@ class Store:
                 self._event(request_id, "grant_revoke_started", now,
                             revoked_by_discord_id=operator_id)
         return self.get(request_id)
+
+    def begin_outbound_revoke(self, request_id: str, now: float, operator_id: str) -> sqlite3.Row:
+        with self.db:
+            row = self.get(request_id)
+            if row["action"] != "outbound_access" or row["status"] not in ("active", "revoking"):
+                raise StateError("outbound grant is not active")
+            if row["status"] == "active":
+                self.db.execute("UPDATE requests SET status='revoking' WHERE id=?", (request_id,))
+                self._event(request_id, "outbound_revoke_started", now,
+                            revoked_by_discord_id=operator_id)
+        return self.get(request_id)
+
+    def mark_outbound_revoked(self, request_id: str, now: float, operator_id: str,
+                              reason: str = "operator") -> sqlite3.Row:
+        with self.db:
+            row = self.get(request_id)
+            if row["action"] != "outbound_access" or row["status"] != "revoking":
+                raise StateError("outbound grant is not revoking")
+            self.db.execute("UPDATE requests SET status='revoked',last_error=? WHERE id=?",
+                            (reason, request_id))
+            self._event(request_id, "outbound_revoked", now,
+                        revoked_by_discord_id=operator_id, reason=reason)
+        return self.get(request_id)
+
+    def active_outbound_rows(self) -> list[sqlite3.Row]:
+        return list(self.db.execute("""SELECT * FROM requests WHERE action='outbound_access'
+                                    AND status IN ('active','revoking') ORDER BY created_at"""))
 
     def mark_revoked(self, request_id: str, now: float, operator_id: str) -> sqlite3.Row:
         with self.db:
@@ -565,7 +601,7 @@ class Store:
 
     def recovery_rows(self, now: float) -> list[sqlite3.Row]:
         return list(self.db.execute("""SELECT * FROM requests WHERE status IN ('approved','executing','revoking')
-              OR (status='active' AND action IN ('firewall_profile','access_grant') AND active_until<=?) ORDER BY created_at""", (now,)))
+              OR (status='active' AND action IN ('firewall_profile','access_grant','outbound_access') AND active_until<=?) ORDER BY created_at""", (now,)))
 
     def close_capture_grants(self, now: float, event: str, *, except_id: str | None = None) -> None:
         if event not in ("capture_superseded", "capture_observed_disabled"):
@@ -587,6 +623,16 @@ class Store:
         fields = ("id", "status", "action", "profile", "description", "canonical_hash",
                   "created_at", "pending_until", "posted_message_id", "active_until", "last_error")
         result = {field: row[field] for field in fields}
+        if row["action"] == "outbound_access" and row["rollback_json"] and row["status"] == "active":
+            intent = json.loads(row["rollback_json"])
+            if intent.get("kind") == "ssh":
+                result["proxy_host"] = "127.0.0.1"
+                result["proxy_port"] = intent.get("proxy_port")
+        if row["action"] == "outbound_access":
+            canonical = json.loads(row["canonical_json"])
+            result["raw_ssh_bypass"] = (canonical["kind"] == "raw"
+                                        and canonical["transport"] == "tcp"
+                                        and canonical["port"] == 22)
         if include_nonce:
             result["nonce"] = row["nonce"]
         return result

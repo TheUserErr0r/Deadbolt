@@ -13,6 +13,26 @@ Deadbolt v0.6 does not claim to protect a host after a full root compromise. Its
 
 ## Action limits and recovery
 
+The opt-in [recorded outbound SSH proxy](docs/recorded-outbound-ssh.md) is a
+separate path from the legacy managed-command broker below. The dedicated
+`deadbolt-ssh-proxy` account, not Hermes, owns the fixed upstream key and
+target host-key pin. Direct Hermes TCP/22 is dropped by an early nft guard,
+and the proxy account receives only a timed exact-IP:port nft entry plus an
+ordered UID-scoped UFW allow. The proxy records every forwarded SSH channel
+chunk to a private, fsynced local spool before forwarding. Spool exhaustion,
+write failure, revoked grant, or expiry terminates the session. Argus needs a
+separate root-only transcript receiver and restricted Loki tenant; ordinary
+audit/Discord never receive transcript bytes. Raw access has no content
+inspection. Non-TCP/22 raw grants use a timed nft element ahead of a persistent
+exact-endpoint drop, so UFW's established-connection accept cannot extend a
+revoked or expired raw grant. The guard does not prevent SSH on other ports,
+including baseline-open public TCP/443. Raw TCP/22 can deliberately bypass SSH recording only after a
+prominent card warning and explicit operator confirmation. These features
+are disabled until a deliberate host migration removes existing static SSH
+exceptions and proves the restricted evidence path. The isolated tests cannot
+prove those live deployment properties; a five-minute Hermes-to-SysReptor-to-Argus
+acceptance test is still required.
+
 Only named root-owned UFW profiles, specifically enabled body-capture actions, and configured managed SSH profiles can be applied. Hermes cannot supply raw firewall rule fields, ports, service units, or shell commands. In a managed SSH profile, Hermes supplies a bounded destination, purpose, TTL, and structured argv; root resolves and pins the IP, and the target receiver runs only root-configured command wrappers. The Teleport and service action interfaces fail closed. UFW output is text rather than a transactional machine API; Deadbolt refuses ambiguous matching rules and records rollback failures for operator attention. An external administrator changing UFW concurrently can still create a narrow race around a CLI operation. Keep profile scopes narrow and review existing firewall rules before deployment.
 
 Managed SSH is disabled by default. When enabled, the dedicated `deadbolt-ssh` account owns the only broker key. Hermes must not read or reuse it. The broker has an early nftables TCP/22 deny for every destination except an active exact pinned IP, plus an exact UID-scoped UFW accept before the UFW deny. The existing Hermes UID and host-wide SysReptor SSH exceptions must be removed during migration. Do not restore host-wide SSH access after a broker failure. The target must force `deadbolt-remote-exec` for the broker key and deny PTY and forwarding. This is noninteractive command execution, not a recording bastion. A compromised target wrapper, root policy, or broker key can exceed the intended command scope; review and isolate those assets.

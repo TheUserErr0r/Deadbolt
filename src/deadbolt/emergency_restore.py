@@ -31,8 +31,16 @@ def restore(config: ExecutorConfig) -> None:
                 if policy.access_profiles:
                     raise RuntimeError("deadbolt-ssh account is required to restore emergency block")
                 broker_uid = None
-            action = EmergencyAction(pwd.getpwnam(config.hermes_user).pw_uid,
-                                     broker_uid=broker_uid)
+            try:
+                proxy_uid = pwd.getpwnam("deadbolt-ssh-proxy").pw_uid
+            except KeyError:
+                if policy.outbound_access.enabled or store.active_outbound_rows():
+                    raise RuntimeError("deadbolt-ssh-proxy account is required to restore emergency block")
+                proxy_uid = None
+            identities = {"broker_uid": broker_uid}
+            if proxy_uid is not None:
+                identities["proxy_uid"] = proxy_uid
+            action = EmergencyAction(pwd.getpwnam(config.hermes_user).pw_uid, **identities)
             try:
                 action.enforce(tuple(state["workload_units"]))
             except Exception:

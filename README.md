@@ -4,7 +4,7 @@
 
 Human-approved, time-limited privileged actions for AI agents.
 
-Deadbolt is an experimental VM control plane for the Hermes agent system. Hermes sends structured requests over local Unix sockets; an unprivileged Discord bot presents them to a human operator; a root executor applies only predefined, root-owned actions. Deadbolt supports UFW profiles, emergency stop and recovery, exact-host body-capture exclusions, and an **opt-in managed SSH broker**. Hermes may supply a bounded structured argv for an approved SSH session, but cannot supply a shell command, arbitrary firewall rule, service name, or systemd unit. The broker is disabled in the example policy and this repository contains no deployment credentials.
+Deadbolt is an experimental VM control plane for the Hermes agent system. Hermes sends structured requests over local Unix sockets; an unprivileged Discord bot presents them to a human operator; a root executor applies only predefined, root-owned actions. Deadbolt supports UFW profiles, emergency stop and recovery, exact-host body-capture exclusions, an opt-in managed SSH broker, and a separate **opt-in recorded outbound SSH proxy**. The new proxy and raw-access path is disabled in the example policy and this repository contains no deployment credentials.
 
 > **Project provenance and caution:** The design was developed by a human for an agentic use case. This entire README was AI-generated from that design and reviewed by a human. That review does not guarantee clear writing, faithful implementation of the design, or suitability for a particular VM. Treat the documentation as a guide to verify against the code and your own test environment before relying on Deadbolt for access control.
 
@@ -45,6 +45,7 @@ The badge at the top shows the latest **push** result for [Deadbolt CI](.github/
 | Check | What it exercises | Runs on |
 | --- | --- | --- |
 | Unit | Policy, emergency state and recovery, exclusion matching, mocked Discord approvals, and capture helper | Pull requests and pushes |
+| SSH proxy wire | SSH-MITM against a disposable loopback target, fixed keys, interactive input/output, and noninteractive command/output recording | Pull requests and pushes |
 | Unix sockets | Real `hermes` and `deadbolt` users, peer credentials, dry-run relay, denial, and audit records | Pushes |
 | systemd restarts | Shipped service units, runtime-directory ownership, executor and bot restarts, and Hermes ingress recovery | Pushes and same-repository pull requests |
 | Firewall | UFW tagged-rule rollback, a real nftables kill-switch, and exact UID-scoped two-layer SSH broker grants in network-isolated Docker containers | Pushes and same-repository pull requests |
@@ -97,6 +98,8 @@ Each Unix-socket exchange is one newline-terminated JSON object of at most 16 Ki
 The bot forwards the request to root, including the UID obtained from peer credentials. Root checks the claimed UID, action and profile, resolves fixed policy fields, and returns a request ID. The Discord card shows the exact resolved action, request ID, and approval deadline. Only the configured Discord user in the configured guild and channel can approve or deny. `/deadbolt status <request-id>` and `/deadbolt deny <request-id>` provide fallbacks.
 
 ### Managed SSH sessions and durable baseline egress
+
+The newer, separately disabled [recorded outbound SSH and raw-access design](docs/recorded-outbound-ssh.md) uses SSH-MITM 6.0.0, a dedicated proxy account, exact UID-scoped grants, and a restricted Argus transcript receiver. It needs no target-side receiver. Raw TCP/22 is explicitly uninspected and requires a warning and confirmation. The direct-SSH guard covers Hermes TCP/22; it does not block SSH on every port, including baseline-open public TCP/443. Its isolated tests do not replace the required live five-minute Hermes/SysReptor/Argus acceptance test; this PR does not deploy it.
 
 The opt-in `ssh-session` family is documented in the [SSH broker profile, request schema, evidence fields, and migration runbook](docs/ssh-broker.md). Its approval card shows the normalized destination and pinned IP, TCP/22, fixed SSH user, TTL, purpose, command limit, and a hash and count for the first structured argv. Approval grants a bounded **session**, not one command. Each later command is a separate validated, counted, audited JSON argv request through the dedicated `deadbolt-ssh` broker and target-side forced-command receiver. A root-configured `audit_output="full"` profile writes exact argv and bounded byte-exact stdout/stderr to the separate restricted evidence sink; it requires a private, writable sink before activation. After that evidence is saved, Hermes receives up to 4 KiB per output stream with explicit truncation flags. Metadata mode discards output. Root-owned profiles can permit foreground commands up to 15 minutes; detached jobs are outside the evidence contract. Hermes does not receive the broker key or a direct SSH firewall exception. Interactive PTY traffic is not captured or supported.
 
