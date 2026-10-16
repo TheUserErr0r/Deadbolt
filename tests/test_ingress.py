@@ -129,9 +129,9 @@ class ApprovalTests(unittest.TestCase):
     def call(self, data):
         return asyncio.run(self.executor.dispatch(data, 101))
 
-    def created(self):
+    def created(self, **changes):
         data = {"op": "create", "action": "ingress_access", "profile": "ingress",
-                "requested_by_uid": 1001, **request()}
+                "requested_by_uid": 1001, **request(**changes)}
         created = self.call(data)["request"]
         self.call({"op": "posted", "request_id": created["id"], "message_id": "44"})
         return self.call({"op": "list", "state": "posted"})["requests"][0]
@@ -186,12 +186,44 @@ class ApprovalTests(unittest.TestCase):
         self.assertFalse(self.firewall.grants)
         self.assertFalse(self.call({"op": "ingress_status", "requested_by_uid": 1001})["grants"])
 
-    def test_overlapping_active_scope_is_not_approved_twice(self):
+    def test_fresh_approval_replaces_identical_scope_with_new_expiry(self):
+        first = self.created()
+        self.assertEqual(self.approve(first)["status"], "active")
+        first_expiry = self.store.get(first["id"])["active_until"]
+        self.now = 1100
+        second = self.created(ttl_seconds=1800, reason="Continue CTF callback")
+        self.assertEqual(self.store.get(first["id"])["status"], "active")
+        self.assertEqual(self.approve(second)["status"], "active")
+        self.assertEqual(self.store.get(first["id"])["status"], "revoked")
+        self.assertEqual(self.store.get(first["id"])["last_error"], "replaced")
+        self.assertEqual(list(self.firewall.grants), [second["id"]])
+        self.assertEqual(self.store.get(second["id"])["active_until"], 2900)
+        self.assertGreater(self.store.get(second["id"])["active_until"], first_expiry)
+        events = [json.loads(line) for line in self.store.audit_path.read_text().splitlines()]
+        replacement = next(event for event in events if event["event"] == "ingress_revoked")
+        self.assertEqual(replacement["replacement_request_id"], second["id"])
+
+    def test_partially_overlapping_scope_still_fails(self):
+        first = self.created()
+        self.assertEqual(self.approve(first)["status"], "active")
+        second = self.created(port_start=6972, port_end=6974)
+        self.assertEqual(self.approve(second)["status"], "failed")
+        self.assertEqual(list(self.firewall.grants), [first["id"]])
+
+    def test_failed_replacement_does_not_activate_new_grant(self):
         first = self.created()
         self.assertEqual(self.approve(first)["status"], "active")
         second = self.created()
+        original_revoke = self.firewall.revoke
+        self.firewall.revoke = lambda *args: (_ for _ in ()).throw(
+            IngressFirewallError("old grant could not be revoked"))
         self.assertEqual(self.approve(second)["status"], "failed")
-        self.assertEqual(list(self.firewall.grants), [first["id"]])
+        self.assertEqual(self.store.get(first["id"])["status"], "revoking")
+        self.assertNotIn(second["id"], self.firewall.grants)
+        self.firewall.revoke = original_revoke
+        asyncio.run(self.executor.reconcile())
+        self.assertEqual(self.store.get(first["id"])["status"], "revoked")
+        self.assertFalse(self.firewall.grants)
 
     def test_malformed_and_unauthorized_requests(self):
         with self.assertRaises(Exception):

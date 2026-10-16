@@ -175,6 +175,20 @@ for scenario in ("revoke", "expiry"):
     firewall.revoke(record, request_id, expiry)
     assert not probe(SOURCE, 6970), "revoke/expiry left a new callback path"
 
+# A fresh approval replaces the same exact scope. The first grant's retained
+# deny must not shadow the second grant's allow in nftables or UFW.
+old_id, new_id = str(uuid.uuid4()), str(uuid.uuid4())
+now = time.time()
+old_expiry = int(now) + 30
+firewall.ensure_grant(record, old_id, old_expiry, now)
+firewall.revoke(record, old_id, old_expiry)
+new_expiry = int(time.time()) + 60
+firewall.ensure_grant(record, new_id, new_expiry, time.time())
+assert probe(SOURCE, 6970), "replacement grant was shadowed by old deny"
+assert not probe(OTHER, 6970), "replacement allowed a different source"
+firewall.revoke(record, new_id, new_expiry)
+assert not probe(SOURCE, 6970), "replacement revoke left a callback path"
+
 cidr_id = str(uuid.uuid4())
 cidr_record = {**record, "source": "192.168.1.0/24", "port_start": 6975,
                "port_end": 6975}

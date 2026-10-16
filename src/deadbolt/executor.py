@@ -682,8 +682,9 @@ class Executor:
             self.store.rollback_error(row["id"], "; ".join(failures), self.clock())
             raise OutboundFirewallError("; ".join(failures))
 
-    def _ingress_overlaps_active(self, canonical: dict[str, Any]) -> bool:
+    def _ingress_overlaps_active(self, canonical: dict[str, Any]) -> tuple[list[Any], bool]:
         source = ipaddress.ip_network(canonical["source"])
+        matching = []
         for row in self.store.active_ingress_rows():
             other = json.loads(row["canonical_json"])
             if (other["protocol"] == canonical["protocol"]
@@ -691,8 +692,12 @@ class Executor:
                     and canonical["port_start"] <= other["port_end"]
                     and other["port_start"] <= canonical["port_end"]
                     and source.overlaps(ipaddress.ip_network(other["source"]))):
-                return True
-        return False
+                same_scope = all(other[field] == canonical[field] for field in
+                                 ("source", "local_ip", "protocol", "port_start", "port_end"))
+                if not same_scope or row["status"] != "active":
+                    return [], True
+                matching.append(row)
+        return matching, False
 
     async def _revoke_ingress(self, row: Any, *, emergency: bool = False) -> None:
         if self.ingress_firewall is None:
@@ -716,10 +721,18 @@ class Executor:
                 if self.store.emergency_state()["state"] != "inactive":
                     raise StateError("emergency stop blocks ingress grants")
                 canonical = self._revalidate(row)
-                if self._ingress_overlaps_active(canonical):
+                matching, conflict = self._ingress_overlaps_active(canonical)
+                if conflict or len(matching) > 1:
                     raise StateError("an overlapping ingress grant is active")
                 if self.ingress_firewall is None:
                     raise IngressFirewallError("ingress firewall is not initialized")
+                if matching:
+                    old = self.store.begin_ingress_revoke(matching[0]["id"], self.clock(),
+                                                          self.hermes_uid,
+                                                          replacement_id=request_id)
+                    await self._revoke_ingress(old)
+                    self.store.mark_ingress_revoked(old["id"], self.clock(), self.hermes_uid,
+                                                    "replaced", replacement_id=request_id)
                 expiry = int(self.clock() + canonical["ttl_seconds"])
                 _set_name, tag = self.ingress_firewall._identity(request_id, expiry)
                 intent = {"source": canonical["source"], "local_ip": canonical["local_ip"],

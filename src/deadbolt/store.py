@@ -427,7 +427,8 @@ class Store:
         return list(self.db.execute("""SELECT * FROM requests WHERE action='ingress_access'
                                     AND status IN ('active','executing','revoking') ORDER BY created_at"""))
 
-    def begin_ingress_revoke(self, request_id: str, now: float, requester_uid: int) -> sqlite3.Row:
+    def begin_ingress_revoke(self, request_id: str, now: float, requester_uid: int,
+                             *, replacement_id: str | None = None) -> sqlite3.Row:
         with self.db:
             row = self.get(request_id)
             if (row["action"] != "ingress_access" or row["requested_by_uid"] != requester_uid
@@ -436,11 +437,11 @@ class Store:
             if row["status"] in ("active", "executing"):
                 self.db.execute("UPDATE requests SET status='revoking' WHERE id=?", (request_id,))
                 self._event(request_id, "ingress_revoke_started", now,
-                            revoked_by_uid=requester_uid)
+                            revoked_by_uid=requester_uid, replacement_request_id=replacement_id)
         return self.get(request_id)
 
     def mark_ingress_revoked(self, request_id: str, now: float, requester_uid: int,
-                             reason: str) -> sqlite3.Row:
+                             reason: str, *, replacement_id: str | None = None) -> sqlite3.Row:
         with self.db:
             row = self.get(request_id)
             if row["action"] != "ingress_access" or row["status"] != "revoking":
@@ -449,7 +450,8 @@ class Store:
             self.db.execute("UPDATE requests SET status=?,last_error=? WHERE id=?",
                             ("expired" if expired else "revoked", reason[:200], request_id))
             self._event(request_id, "ingress_expired" if expired else "ingress_revoked", now,
-                        revoked_by_uid=requester_uid, reason=reason)
+                        revoked_by_uid=requester_uid, reason=reason,
+                        replacement_request_id=replacement_id)
         return self.get(request_id)
 
     def mark_revoked(self, request_id: str, now: float, operator_id: str) -> sqlite3.Row:

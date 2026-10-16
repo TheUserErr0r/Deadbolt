@@ -25,9 +25,16 @@ must be a canonical literal IPv4/IPv6 address or canonical CIDR of no more
 than 256 addresses, wholly inside a reviewed policy CIDR. The destination
 must be a canonical private LAN IP currently assigned to a non-loopback
 Hermes interface. Root rejects loopback, public destinations, ports below
-1024, mixed address families, broad or ambiguous sources, and overlapping
-active grants. Policy changes invalidate pending approvals; removing a source
-boundary revokes active grants on reconciliation. Restart the executor after
+1024, mixed address families, and broad or ambiguous sources. Partially
+overlapping active grants are rejected. A newly approved request for the
+same exact source, local IP, protocol, and port range replaces the old grant:
+Deadbolt revokes the old rule before installing and verifying the new one.
+The new TTL starts from this approval, not from the old expiry. A pending or
+denied request never changes the active grant; if old-rule revocation fails,
+the new request fails closed and reconciliation retries the old rollback.
+Both request IDs and the replacement are audited. Policy changes invalidate
+pending approvals; removing a source boundary revokes active grants on
+reconciliation. Restart the executor after
 enabling ingress so it initializes the firewall adapter.
 
 ## Request and approval
