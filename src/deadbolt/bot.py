@@ -16,8 +16,10 @@ from typing import Any, Awaitable, Callable
 
 from deadbolt.access import command_argv, destination, purpose
 from deadbolt.outbound import literal_ip, exact_port
+from deadbolt.ingress import _network, _local_ip
 
-from deadbolt.protocol import (EMERGENCY_RESPONSE_TIMEOUT_SECONDS, SSH_RESPONSE_TIMEOUT_SECONDS, MAX_MESSAGE_BYTES,
+from deadbolt.protocol import (EMERGENCY_RESPONSE_TIMEOUT_SECONDS, SSH_RESPONSE_TIMEOUT_SECONDS,
+                               INGRESS_RESPONSE_TIMEOUT_SECONDS, MAX_MESSAGE_BYTES,
                                ProtocolError, peer_uid, read_message, require_fields, rpc,
                                write_message)
 
@@ -59,7 +61,7 @@ class Relay:
         self.hermes_uid = pwd.getpwnam(config.hermes_user).pw_uid
 
     async def root(self, payload: dict[str, Any], *, emergency_response: bool = False,
-                   ssh_response: bool = False) -> dict[str, Any]:
+                   ssh_response: bool = False, ingress_response: bool = False) -> dict[str, Any]:
         if payload.get("op") == "emergency_stop" and emergency_response:
             # The kill switch must not queue behind a running SSH RPC. The
             # executor independently authenticates and validates this call.
@@ -78,6 +80,9 @@ class Relay:
             elif ssh_response:
                 response = await self.root_rpc(str(self.config.executor_socket), payload,
                     response_timeout_seconds=SSH_RESPONSE_TIMEOUT_SECONDS)
+            elif ingress_response:
+                response = await self.root_rpc(str(self.config.executor_socket), payload,
+                    response_timeout_seconds=INGRESS_RESPONSE_TIMEOUT_SECONDS)
             else:
                 response = await self.root_rpc(str(self.config.executor_socket), payload)
         if not response.get("ok"):
@@ -95,6 +100,15 @@ class Relay:
                 raise ProtocolError("invalid outbound request ID")
             return await self.root({"op": "outbound_status", "request_id": message["request_id"],
                                     "requested_by_uid": uid})
+        if message.get("op") == "ingress_status":
+            require_fields(message, {"op"})
+            return await self.root({"op": "ingress_status", "requested_by_uid": uid})
+        if message.get("op") == "ingress_revoke":
+            require_fields(message, {"op", "request_id"})
+            if not isinstance(message["request_id"], str):
+                raise ProtocolError("invalid ingress grant ID")
+            return await self.root({"op": "ingress_revoke", "request_id": message["request_id"],
+                                    "requested_by_uid": uid}, ingress_response=True)
         if message.get("op") == "ssh_execute":
             require_fields(message, {"op", "request_id", "destination", "argv"})
             if not isinstance(message["request_id"], str):
@@ -127,6 +141,23 @@ class Relay:
             if kind == "raw":
                 payload["transport"] = message["transport"]
             return await self.root(payload)
+        if message.get("action") == "ingress_access":
+            require_fields(message, {"op", "action", "protocol", "source_ip", "local_ip",
+                                     "port_start", "port_end", "ttl_seconds", "reason"})
+            _network(message["source_ip"])
+            _local_ip(message["local_ip"])
+            purpose(message["reason"])
+            if (message["protocol"] not in ("tcp", "udp")
+                    or type(message["port_start"]) is not int
+                    or type(message["port_end"]) is not int
+                    or type(message["ttl_seconds"]) is not int):
+                raise ProtocolError("invalid ingress request fields")
+            return await self.root({"op": "create", "action": "ingress_access", "profile": "ingress",
+                                    "protocol": message["protocol"], "source_ip": message["source_ip"],
+                                    "local_ip": message["local_ip"], "port_start": message["port_start"],
+                                    "port_end": message["port_end"], "ttl_seconds": message["ttl_seconds"],
+                                    "reason": message["reason"], "requested_by_uid": uid},
+                                   ingress_response=True)
         if message.get("action") == "access_grant":
             require_fields(message, {"op", "action", "profile", "destination", "purpose",
                                      "ttl_seconds", "command"})
@@ -252,7 +283,9 @@ class Relay:
                                  emergency_response=(decision == "approve" and
                                                      row.get("action") == "emergency_recover"),
                                  ssh_response=(decision == "approve" and
-                                               row.get("action") in ("access_grant", "outbound_access"))))["request"]
+                                               row.get("action") in ("access_grant", "outbound_access")),
+                                 ingress_response=(decision == "approve" and
+                                                   row.get("action") == "ingress_access")))["request"]
 
     async def decide_posted(self, card: dict[str, Any], decision: str, message_id: str,
                             interaction_id: str, user_id: str, guild_id: str,

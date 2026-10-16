@@ -20,6 +20,9 @@ EMERGENCY_RESPONSE_TIMEOUT_SECONDS = 180
 # Bounds a root-configured foreground command (up to 15 minutes), plus exact
 # firewall verification and evidence delivery. Inbound request reads stay 5 sec.
 SSH_RESPONSE_TIMEOUT_SECONDS = MAX_COMMAND_SECONDS + 90
+# Bounded nft/UFW application and verification can use several fixed 10s host
+# calls. The untrusted inbound request reader remains at five seconds.
+INGRESS_RESPONSE_TIMEOUT_SECONDS = 90
 
 
 class ProtocolError(ValueError):

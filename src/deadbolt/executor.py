@@ -8,6 +8,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -24,6 +25,8 @@ from deadbolt.access import AccessError, canonical_access, command_argv, describ
 from deadbolt.broker_firewall import BrokerFirewall, BrokerFirewallError
 from deadbolt.outbound import OutboundError, canonical_outbound, describe_outbound
 from deadbolt.outbound_firewall import ExactEgress, OutboundFirewallError
+from deadbolt.ingress import IngressError, canonical_ingress, describe_ingress
+from deadbolt.ingress_firewall import IngressFirewall, IngressFirewallError
 from deadbolt.proxy_manager import ProxyManager, ProxyError
 from deadbolt.config import ConfigurationError, ExecutorConfig, Policy, describe_action, normalize_workload_units, resolve_action
 from deadbolt.protocol import MAX_MESSAGE_BYTES, ProtocolError, peer_uid, read_message, require_fields, write_message
@@ -63,7 +66,8 @@ class Executor:
                  access_action: BrokerFirewall | None = None,
                  ssh_executor: SystemdSSHExecutor | None = None,
                  outbound_firewall: ExactEgress | None = None,
-                 proxy_manager: ProxyManager | None = None):
+                 proxy_manager: ProxyManager | None = None,
+                 ingress_firewall: IngressFirewall | None = None):
         self.config = config
         self.policy = policy
         self.policy_loader = policy_loader or (lambda: Policy.load(config.profiles_path))
@@ -87,6 +91,8 @@ class Executor:
         self.outbound_firewall = outbound_firewall or (
             ExactEgress(pwd.getpwnam(config.hermes_user).pw_uid, proxy_uid)
             if proxy_uid is not None else None)
+        self.ingress_firewall = ingress_firewall or (
+            IngressFirewall() if policy.ingress_access.enabled or store.active_ingress_rows() else None)
         self.proxy_manager = proxy_manager or ProxyManager()
         self.capture_action = capture_action or CaptureAction()
         self.exclusions_action = exclusions_action or ExclusionsAction()
@@ -144,6 +150,12 @@ class Executor:
                 destination=original["destination"], port=original["port"],
                 ttl_seconds=original["ttl_seconds"], purpose=original["purpose"],
                 transport=original["transport"] if original["kind"] == "raw" else None)
+        elif original["action"] == "ingress_access":
+            current = canonical_ingress(policy.ingress_access,
+                protocol=original["protocol"], source_ip=original["source"],
+                local_ip=original["local_ip"], port_start=original["port_start"],
+                port_end=original["port_end"], ttl_seconds=original["ttl_seconds"],
+                reason=original["reason"])
         elif exclusions:
             self.exclusions_action.validate(original)
             if (original["hostname"] not in policy.body_exclusion_allowed_hosts
@@ -158,7 +170,8 @@ class Executor:
         if (canonical_json(current) != row["canonical_json"] or
                 hashlib.sha256(row["canonical_json"].encode()).hexdigest() != row["canonical_hash"]):
             raise StateError("stored action no longer matches root policy")
-        if original["action"] not in ("emergency_recover", "access_grant", "outbound_access"):
+        if original["action"] not in ("emergency_recover", "access_grant", "outbound_access",
+                                      "ingress_access"):
             (self.capture_action if capture else self.exclusions_action if exclusions else
              self.action).validate(current)
         return current
@@ -224,6 +237,15 @@ class Executor:
                         message["user_id"], "emergency_stop; request a new grant")
                 except Exception:
                     failures.append("outbound grant revocation failed")
+            for ingress in self.store.active_ingress_rows():
+                try:
+                    ingress = self.store.begin_ingress_revoke(ingress["id"], self.clock(),
+                                                               self.hermes_uid)
+                    await self._revoke_ingress(ingress, emergency=True)
+                    self.store.mark_ingress_revoked(ingress["id"], self.clock(),
+                                                     self.hermes_uid, "emergency_stop")
+                except Exception:
+                    failures.append("ingress grant revocation failed")
             if first_stop:
                 previous = await self._emergency_call(self.emergency_action.active_units, units)
                 state = self.store.emergency_transition(("stopping",), "stopping",
@@ -284,7 +306,8 @@ class Executor:
         if op == "create":
             require_fields(message, {"op", "action", "profile", "reason", "requested_by_uid"},
                            {"ttl_seconds", "hours", "destination", "purpose", "command",
-                            "kind", "port", "transport"})
+                            "kind", "port", "transport", "protocol", "source_ip", "local_ip",
+                            "port_start", "port_end"})
             if type(message["requested_by_uid"]) is not int or message["requested_by_uid"] != self.hermes_uid:
                 raise ProtocolError("invalid claimed request origin")
             if not all(isinstance(message[key], str) for key in ("action", "profile", "reason")):
@@ -319,8 +342,22 @@ class Executor:
                     port=message["port"], ttl_seconds=message["ttl_seconds"],
                     purpose=message["purpose"], transport=message.get("transport"))
                 description = describe_outbound(canonical)
+            elif message["action"] == "ingress_access":
+                require_fields(message, {"op", "action", "profile", "reason", "requested_by_uid",
+                                         "protocol", "source_ip", "local_ip", "port_start", "port_end",
+                                         "ttl_seconds"})
+                if message["profile"] != "ingress" or self.ingress_firewall is None:
+                    raise IngressError("ingress is not configured")
+                canonical = canonical_ingress(self.policy_loader().ingress_access,
+                    protocol=message["protocol"], source_ip=message["source_ip"],
+                    local_ip=message["local_ip"], port_start=message["port_start"],
+                    port_end=message["port_end"], ttl_seconds=message["ttl_seconds"],
+                    reason=message["reason"])
+                await self._host_call(self.ingress_firewall.assert_local_ip, canonical["local_ip"])
+                description = describe_ingress(canonical)
             else:
-                if set(message) & {"destination", "purpose", "command", "kind", "port", "transport"}:
+                if set(message) & {"destination", "purpose", "command", "kind", "port", "transport",
+                                   "protocol", "source_ip", "local_ip", "port_start", "port_end"}:
                     raise ProtocolError("unexpected access fields")
                 canonical = resolve_action(message["action"], message["profile"], message["reason"],
                                            message.get("ttl_seconds"), self.policy_loader(), self.config,
@@ -412,6 +449,28 @@ class Executor:
             row = self.store.begin_outbound_revoke(row["id"], now, message["user_id"])
             await self._revoke_outbound(row)
             row = self.store.mark_outbound_revoked(row["id"], self.clock(), message["user_id"])
+            return {"ok": True, "request": self.store.public(row)}
+        if op == "ingress_status":
+            require_fields(message, {"op", "requested_by_uid"})
+            if type(message["requested_by_uid"]) is not int or message["requested_by_uid"] != self.hermes_uid:
+                raise ProtocolError("invalid claimed request origin")
+            rows = [row for row in self.store.active_ingress_rows()
+                    if row["requested_by_uid"] == self.hermes_uid and row["status"] == "active"
+                    and row["active_until"] is not None and row["active_until"] > now]
+            return {"ok": True, "grants": [self.store.public(row) for row in rows]}
+        if op == "ingress_revoke":
+            require_fields(message, {"op", "request_id", "requested_by_uid"})
+            if type(message["requested_by_uid"]) is not int or message["requested_by_uid"] != self.hermes_uid:
+                raise ProtocolError("invalid claimed request origin")
+            row = self.store.get(message["request_id"])
+            if row["action"] != "ingress_access" or row["requested_by_uid"] != self.hermes_uid:
+                raise StateError("request is not a Hermes ingress grant")
+            if row["status"] in ("revoked", "expired", "rolled_back", "failed"):
+                return {"ok": True, "request": self.store.public(row)}
+            row = self.store.begin_ingress_revoke(row["id"], now, self.hermes_uid)
+            await self._revoke_ingress(row)
+            row = self.store.mark_ingress_revoked(row["id"], self.clock(), self.hermes_uid,
+                                                  "requester")
             return {"ok": True, "request": self.store.public(row)}
         if op == "access_revoke":
             require_fields(message, {"op", "request_id", "user_id", "guild_id", "channel_id", "interaction_id"})
@@ -559,8 +618,8 @@ class Executor:
                 raise ProtocolError("invalid raw SSH confirmation")
             try:
                 self._revalidate(row)
-            except (AccessError, OutboundError, StateError, ActionError, ConfigurationError) as exc:
-                if row["action"] in ("access_grant", "outbound_access") and row["status"] in ("pending", "posted"):
+            except (AccessError, OutboundError, IngressError, StateError, ActionError, ConfigurationError) as exc:
+                if row["action"] in ("access_grant", "outbound_access", "ingress_access") and row["status"] in ("pending", "posted"):
                     self.store.invalidate_pending(row["id"], now, str(exc))
                 raise
             row = self.store.decide(message["request_id"], message["decision"], message["nonce"],
@@ -623,9 +682,73 @@ class Executor:
             self.store.rollback_error(row["id"], "; ".join(failures), self.clock())
             raise OutboundFirewallError("; ".join(failures))
 
+    def _ingress_overlaps_active(self, canonical: dict[str, Any]) -> bool:
+        source = ipaddress.ip_network(canonical["source"])
+        for row in self.store.active_ingress_rows():
+            other = json.loads(row["canonical_json"])
+            if (other["protocol"] == canonical["protocol"]
+                    and other["local_ip"] == canonical["local_ip"]
+                    and canonical["port_start"] <= other["port_end"]
+                    and other["port_start"] <= canonical["port_end"]
+                    and source.overlaps(ipaddress.ip_network(other["source"]))):
+                return True
+        return False
+
+    async def _revoke_ingress(self, row: Any, *, emergency: bool = False) -> None:
+        if self.ingress_firewall is None:
+            raise IngressFirewallError("ingress firewall is not initialized")
+        if not row["rollback_json"]:
+            raise StateError("ingress rollback intent is missing")
+        canonical = json.loads(row["canonical_json"])
+        intent = json.loads(row["rollback_json"])
+        call = self._emergency_call if emergency else self._host_call
+        try:
+            await call(self.ingress_firewall.revoke, canonical, row["id"], intent["expiry"])
+        except Exception:
+            self.store.rollback_error(row["id"], "ingress rollback requires inspection", self.clock())
+            raise
+
     async def _execute(self, row: Any) -> Any:
         request_id = row["id"]
         now = self.clock()
+        if row["action"] == "ingress_access":
+            try:
+                if self.store.emergency_state()["state"] != "inactive":
+                    raise StateError("emergency stop blocks ingress grants")
+                canonical = self._revalidate(row)
+                if self._ingress_overlaps_active(canonical):
+                    raise StateError("an overlapping ingress grant is active")
+                if self.ingress_firewall is None:
+                    raise IngressFirewallError("ingress firewall is not initialized")
+                expiry = int(self.clock() + canonical["ttl_seconds"])
+                _set_name, tag = self.ingress_firewall._identity(request_id, expiry)
+                intent = {"source": canonical["source"], "local_ip": canonical["local_ip"],
+                          "protocol": canonical["protocol"], "port_start": canonical["port_start"],
+                          "port_end": canonical["port_end"], "expiry": expiry, "tag": tag}
+                self.store.mark_executing(request_id, intent, self.clock())
+                await self._host_call(self.ingress_firewall.ensure_grant,
+                                      canonical, request_id, expiry, self.clock())
+                await self._host_call(self.ingress_firewall.assert_grant,
+                                      canonical, request_id, expiry)
+                if self.clock() >= expiry or self.store.emergency_state()["state"] != "inactive":
+                    raise StateError("ingress grant interrupted before activation")
+                return self.store.mark_active(request_id, self.clock(), active_until=expiry)
+            except Exception as exc:
+                current = self.store.get(request_id)
+                if current["rollback_json"]:
+                    try:
+                        # Emergency stop can revoke the executing row while a
+                        # host call is still creating its rule. Revoke again
+                        # after that host call returns, even if the row has
+                        # already reached a terminal state.
+                        await self._revoke_ingress(current)
+                    except Exception:
+                        return self.store.get(request_id)
+                if current["status"] not in ("approved", "executing"):
+                    return self.store.get(request_id)
+                failure = str(exc) if isinstance(exc, (IngressError, IngressFirewallError,
+                    StateError, ConfigurationError)) else "internal ingress access error"
+                return self.store.mark_failed(request_id, failure, self.clock())
         if row["action"] == "outbound_access":
             try:
                 if self.store.emergency_state()["state"] != "inactive":
@@ -815,6 +938,31 @@ class Executor:
         async with self.lock:
             now = self.clock()
             self.store.expire_pending(now)
+            if self.ingress_firewall is not None:
+                await self._host_call(self.ingress_firewall.ensure_guard)
+                for ingress in self.store.active_ingress_rows():
+                    expiry = ingress["active_until"]
+                    expired = expiry is not None and expiry <= now
+                    emergency = self.store.emergency_state()["state"] != "inactive"
+                    policy_changed = False
+                    try:
+                        self._revalidate(ingress)
+                    except (IngressError, StateError, ConfigurationError):
+                        policy_changed = True
+                    if ingress["status"] in ("revoking", "executing") or expired or emergency or policy_changed:
+                        if ingress["status"] in ("active", "executing"):
+                            ingress = self.store.begin_ingress_revoke(ingress["id"], now,
+                                                                        self.hermes_uid)
+                        await self._revoke_ingress(ingress)
+                        self.store.mark_ingress_revoked(ingress["id"], self.clock(),
+                            self.hermes_uid, "expired" if expired else
+                            "emergency_stop" if emergency else
+                            "policy_changed" if policy_changed else "reconciliation")
+                    else:
+                        intent = json.loads(ingress["rollback_json"])
+                        await self._host_call(self.ingress_firewall.ensure_grant,
+                            json.loads(ingress["canonical_json"]), ingress["id"],
+                            intent["expiry"], now)
             if self.outbound_firewall is not None:
                 await self._host_call(self.outbound_firewall.ensure_guard)
                 for outbound in self.store.active_outbound_rows():
@@ -898,6 +1046,11 @@ class Executor:
                     LOG.exception("emergency switch reconciliation failed")
             for row in self.store.recovery_rows(now):
                 if row["status"] == "revoking":
+                    if row["action"] == "ingress_access":
+                        await self._revoke_ingress(row)
+                        self.store.mark_ingress_revoked(row["id"], self.clock(),
+                            self.hermes_uid, "reconciliation")
+                        continue
                     intent = json.loads(row["rollback_json"])
                     assert self.access_action is not None
                     await self._host_call(self.access_action.revoke,
@@ -950,6 +1103,8 @@ class Executor:
                             rollback["pinned_ip"], row["id"], rollback["expiry"])
                     elif row["action"] == "outbound_access":
                         await self._revoke_outbound(row)
+                    elif row["action"] == "ingress_access":
+                        await self._revoke_ingress(row)
                     else:
                         self.action.rollback(canonical, rollback)
                 except Exception as exc:
@@ -973,7 +1128,8 @@ class Executor:
             message = await read_message(reader)
             response = await self.dispatch(message, self.bot_uid)
         except (ProtocolError, StateError, ConfigurationError, ActionError, AccessError,
-                BrokerFirewallError, OutboundError, OutboundFirewallError, ProxyError, ValueError) as exc:
+                BrokerFirewallError, OutboundError, OutboundFirewallError,
+                IngressError, IngressFirewallError, ProxyError, ValueError) as exc:
             response = {"ok": False, "error": str(exc)}
         except Exception:
             LOG.exception("unexpected executor error")

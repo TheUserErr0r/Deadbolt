@@ -4,7 +4,7 @@
 
 Human-approved, time-limited privileged actions for AI agents.
 
-Deadbolt is an experimental VM control plane for the Hermes agent system. Hermes sends structured requests over local Unix sockets; an unprivileged Discord bot presents them to a human operator; a root executor applies only predefined, root-owned actions. Deadbolt supports UFW profiles, emergency stop and recovery, exact-host body-capture exclusions, an opt-in managed SSH broker, and a separate **opt-in recorded outbound SSH proxy**. The new proxy and raw-access path is disabled in the example policy and this repository contains no deployment credentials.
+Deadbolt is an experimental VM control plane for the Hermes agent system. Hermes sends structured requests over local Unix sockets; an unprivileged Discord bot presents them to a human operator; a root executor applies only predefined, root-owned actions. Deadbolt supports UFW profiles, emergency stop and recovery, exact-host body-capture exclusions, an opt-in managed SSH broker, a separate **opt-in recorded outbound SSH proxy**, and opt-in temporary inbound listener grants. The newer access paths are disabled in the example policy and this repository contains no deployment credentials.
 
 > **Project provenance and caution:** The design was developed by a human for an agentic use case. This entire README was AI-generated from that design and reviewed by a human. That review does not guarantee clear writing, faithful implementation of the design, or suitability for a particular VM. Treat the documentation as a guide to verify against the code and your own test environment before relying on Deadbolt for access control.
 
@@ -30,7 +30,7 @@ The bot verifies the Hermes UID using Linux `SO_PEERCRED`. The root executor ver
 
 Requires Python 3.12 or newer. The executor uses only the Python standard library. The live bot needs `discord.py`; the unit tests and dry-run relay do not.
 
-For an isolated installation, create a Python virtual environment and install `.` for the executor or `.[bot]` for the Discord relay. The package exposes `deadbolt-executor`, `deadbolt-emergency-restore`, `deadbolt-baseline`, `deadbolt-ssh-guard`, and `deadbolt-bot` commands.
+For an isolated installation, create a Python virtual environment and install `.` for the executor or `.[bot]` for the Discord relay. The package exposes `deadbolt-executor`, `deadbolt-emergency-restore`, `deadbolt-baseline`, `deadbolt-ssh-guard`, `deadbolt-bot`, and `deadbolt-access` commands.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
@@ -48,7 +48,7 @@ The badge at the top shows the latest **push** result for [Deadbolt CI](.github/
 | SSH proxy wire | SSH-MITM against a disposable loopback target, fixed keys, interactive input/output, and noninteractive command/output recording | Pull requests and pushes |
 | Unix sockets | Real `hermes` and `deadbolt` users, peer credentials, dry-run relay, denial, and audit records | Pushes |
 | systemd restarts | Shipped service units, runtime-directory ownership, executor and bot restarts, and Hermes ingress recovery | Pushes and same-repository pull requests |
-| Firewall | UFW tagged-rule rollback, a real nftables kill-switch, and exact UID-scoped two-layer SSH broker grants in network-isolated Docker containers | Pushes and same-repository pull requests |
+| Firewall | UFW tagged-rule rollback, a real nftables kill-switch, exact UID-scoped SSH grants, and temporary inbound listener grants in network-isolated Docker containers | Pushes and same-repository pull requests |
 
 Each job uses a fresh GitHub-hosted runner. No bot token, Discord server, Hermes host, or Argus service is involved.
 
@@ -98,6 +98,8 @@ Each Unix-socket exchange is one newline-terminated JSON object of at most 16 Ki
 The bot forwards the request to root, including the UID obtained from peer credentials. Root checks the claimed UID, action and profile, resolves fixed policy fields, and returns a request ID. The Discord card shows the exact resolved action, request ID, and approval deadline. Only the configured Discord user in the configured guild and channel can approve or deny. `/deadbolt status <request-id>` and `/deadbolt deny <request-id>` provide fallbacks.
 
 ### Managed SSH sessions and durable baseline egress
+
+Temporary target-initiated callback listeners use a **separate**, opt-in [ingress grant policy and CLI](docs/ingress-access.md). A `deadbolt-access request raw` command remains outbound only. An ingress grant specifies a reviewed source IP/CIDR, an IP assigned to a non-loopback Hermes LAN interface, TCP or UDP, one port or a small range, and a bounded TTL. Root verifies and applies an exact UFW accept plus an earlier nftables expiry guard. Hermes may inspect or revoke its own grants; creation always needs Discord operator approval. This repository does not enable a live listener.
 
 The newer, separately disabled [recorded outbound SSH and raw-access design](docs/recorded-outbound-ssh.md) uses SSH-MITM 6.0.0, a dedicated proxy account, exact UID-scoped grants, and a restricted Argus transcript receiver. It needs no target-side receiver. Raw TCP/22 is explicitly uninspected and requires a warning and confirmation. The direct-SSH guard covers Hermes TCP/22; it does not block SSH on every port, including baseline-open public TCP/443. Its isolated tests do not replace the required live five-minute Hermes/SysReptor/Argus acceptance test; this PR does not deploy it.
 

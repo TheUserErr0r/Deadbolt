@@ -27,6 +27,14 @@
 # key = "/etc/deadbolt-ssh-proxy/keys/sysreptor"
 # host_fingerprint = "SHA256:REPLACE_WITH_VERIFIED_TARGET_FINGERPRINT"
 
+# Separate target-initiated listener grants; disabled by default. Root checks
+# that the requested private local IP is assigned to a non-loopback interface.
+# [ingress_access]
+# enabled = true
+# max_ttl_seconds = 3600
+# max_port_width = 5
+# allowed_source_cidrs = ["192.168.1.0/24"]
+
 # [access_profiles.ssh-session]
 # direction = "out"
 # protocol = "tcp"
