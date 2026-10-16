@@ -10,6 +10,7 @@ import tomllib
 
 from deadbolt.access import AccessProfile, AccessError
 from deadbolt.outbound import OutboundPolicy, OutboundError
+from deadbolt.ingress import IngressPolicy, IngressError
 
 
 NAME = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
@@ -89,12 +90,13 @@ class Policy:
     emergency_workload_units: tuple[str, ...] = ()
     access_profiles: dict[str, AccessProfile] | None = None
     outbound_access: OutboundPolicy = OutboundPolicy()
+    ingress_access: IngressPolicy = IngressPolicy()
 
     @classmethod
     def load(cls, path: Path) -> Policy:
         with path.open("rb") as stream:
             raw = tomllib.load(stream)
-        if not set(raw) <= {"firewall_profiles", "access_profiles", "proxy_body_capture", "body_capture_exclusions", "emergency_stop", "outbound_access"} or not isinstance(raw.get("firewall_profiles"), dict):
+        if not set(raw) <= {"firewall_profiles", "access_profiles", "proxy_body_capture", "body_capture_exclusions", "emergency_stop", "outbound_access", "ingress_access"} or not isinstance(raw.get("firewall_profiles"), dict):
             raise ConfigurationError("profiles.toml requires [firewall_profiles]")
         capture = raw.get("proxy_body_capture", {"enabled": False})
         if not isinstance(capture, dict) or set(capture) != {"enabled"} or type(capture["enabled"]) is not bool:
@@ -114,10 +116,11 @@ class Policy:
             access = {name: AccessProfile.from_mapping(name, value)
                       for name, value in access_raw.items()}
             outbound = OutboundPolicy.parse(raw.get("outbound_access"))
-        except (AccessError, OutboundError) as exc:
+            ingress = IngressPolicy.parse(raw.get("ingress_access"))
+        except (AccessError, OutboundError, IngressError) as exc:
             raise ConfigurationError(str(exc)) from exc
         return cls({name: FirewallProfile.from_mapping(name, value)
-                    for name, value in raw["firewall_profiles"].items()}, capture["enabled"], allowed, units, access, outbound)
+                    for name, value in raw["firewall_profiles"].items()}, capture["enabled"], allowed, units, access, outbound, ingress)
 
 
 def normalize_hosts(value: object) -> tuple[str, ...]:

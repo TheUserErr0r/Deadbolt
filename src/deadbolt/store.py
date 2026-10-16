@@ -215,6 +215,8 @@ class Store:
                         profile=canonical["profile"], ttl_seconds=canonical["ttl_seconds"],
                         requested_by_uid=requested_by_uid, requested_by_discord_id=requested_by_discord_id,
                         destination=canonical.get("destination"),
+                        source=canonical.get("source"), local_ip=canonical.get("local_ip"),
+                        port_start=canonical.get("port_start"), port_end=canonical.get("port_end"),
                         pinned_ips=canonical.get("pinned_ips"), ports=canonical.get("ports"),
                         protocol=canonical.get("protocol"), purpose=canonical.get("purpose"),
                         first_command=(command_summary(canonical["initial_command"])
@@ -283,6 +285,9 @@ class Store:
                         action=row["action"], profile=row["profile"],
                         approved_by_discord_id=user_id, canonical_hash=canonical_hash,
                         destination=canonical.get("destination"),
+                        source=canonical.get("source"), local_ip=canonical.get("local_ip"),
+                        port_start=canonical.get("port_start"), port_end=canonical.get("port_end"),
+                        protocol=canonical.get("protocol"),
                         pinned_ips=canonical.get("pinned_ips"), purpose=canonical.get("purpose"),
                         first_command=(command_summary(canonical["initial_command"])
                             if canonical.get("audit_output") == "full" else canonical.get("initial_command")),
@@ -323,6 +328,13 @@ class Store:
                 fields.update(destination=canonical["destination"], port=canonical["port"],
                               protocol=canonical["transport"], purpose=canonical["purpose"],
                               kind=canonical["kind"], uid=intent["uid"],
+                              rule_identity=intent["tag"])
+            elif row["action"] == "ingress_access":
+                canonical = json.loads(row["canonical_json"])
+                intent = json.loads(row["rollback_json"])
+                fields.update(source=canonical["source"], local_ip=canonical["local_ip"],
+                              protocol=canonical["protocol"],
+                              port_start=canonical["port_start"], port_end=canonical["port_end"],
                               rule_identity=intent["tag"])
             if helper_outcome is not None:
                 fields["helper_outcome"] = helper_outcome
@@ -410,6 +422,37 @@ class Store:
     def active_outbound_rows(self) -> list[sqlite3.Row]:
         return list(self.db.execute("""SELECT * FROM requests WHERE action='outbound_access'
                                     AND status IN ('active','revoking') ORDER BY created_at"""))
+
+    def active_ingress_rows(self) -> list[sqlite3.Row]:
+        return list(self.db.execute("""SELECT * FROM requests WHERE action='ingress_access'
+                                    AND status IN ('active','executing','revoking') ORDER BY created_at"""))
+
+    def begin_ingress_revoke(self, request_id: str, now: float, requester_uid: int,
+                             *, replacement_id: str | None = None) -> sqlite3.Row:
+        with self.db:
+            row = self.get(request_id)
+            if (row["action"] != "ingress_access" or row["requested_by_uid"] != requester_uid
+                    or row["status"] not in ("active", "executing", "revoking")):
+                raise StateError("ingress grant is not active or owned by requester")
+            if row["status"] in ("active", "executing"):
+                self.db.execute("UPDATE requests SET status='revoking' WHERE id=?", (request_id,))
+                self._event(request_id, "ingress_revoke_started", now,
+                            revoked_by_uid=requester_uid, replacement_request_id=replacement_id)
+        return self.get(request_id)
+
+    def mark_ingress_revoked(self, request_id: str, now: float, requester_uid: int,
+                             reason: str, *, replacement_id: str | None = None) -> sqlite3.Row:
+        with self.db:
+            row = self.get(request_id)
+            if row["action"] != "ingress_access" or row["status"] != "revoking":
+                raise StateError("ingress grant is not revoking")
+            expired = reason == "expired"
+            self.db.execute("UPDATE requests SET status=?,last_error=? WHERE id=?",
+                            ("expired" if expired else "revoked", reason[:200], request_id))
+            self._event(request_id, "ingress_expired" if expired else "ingress_revoked", now,
+                        revoked_by_uid=requester_uid, reason=reason,
+                        replacement_request_id=replacement_id)
+        return self.get(request_id)
 
     def mark_revoked(self, request_id: str, now: float, operator_id: str) -> sqlite3.Row:
         with self.db:
@@ -601,7 +644,7 @@ class Store:
 
     def recovery_rows(self, now: float) -> list[sqlite3.Row]:
         return list(self.db.execute("""SELECT * FROM requests WHERE status IN ('approved','executing','revoking')
-              OR (status='active' AND action IN ('firewall_profile','access_grant','outbound_access') AND active_until<=?) ORDER BY created_at""", (now,)))
+              OR (status='active' AND action IN ('firewall_profile','access_grant','outbound_access','ingress_access') AND active_until<=?) ORDER BY created_at""", (now,)))
 
     def close_capture_grants(self, now: float, event: str, *, except_id: str | None = None) -> None:
         if event not in ("capture_superseded", "capture_observed_disabled"):
@@ -633,6 +676,11 @@ class Store:
             result["raw_ssh_bypass"] = (canonical["kind"] == "raw"
                                         and canonical["transport"] == "tcp"
                                         and canonical["port"] == 22)
+        if row["action"] == "ingress_access":
+            canonical = json.loads(row["canonical_json"])
+            result.update(source=canonical["source"], local_ip=canonical["local_ip"],
+                          protocol=canonical["protocol"],
+                          port_start=canonical["port_start"], port_end=canonical["port_end"])
         if include_nonce:
             result["nonce"] = row["nonce"]
         return result
